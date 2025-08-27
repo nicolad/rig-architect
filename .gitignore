@@ -1,0 +1,57 @@
+# Rust build artifacts
+/target/
+
+# Local clone of external repo
+/nautilus_trader/
+
+# Autopatcher backup files
+.autopatch_backups/
+
+# Logs
+/logs/
+/.logs/
+
+# macOS
+.DS_Store
+
+# Editors/IDEs
+.vscode/
+.idea/
+.fastembed_cache
+# FastEmbed/HF models cache
+.fastembed_cache/
+/models/
+
+# Databases and local state
+*.db
+*.sqlite
+*.sqlite3
+
+# Env files
+.env
+.env.*
+
+# Logs
+*.log
+
+# Editor/OS backups and swap files
+*~
+*.swp
+*.swo
+*.tmp
+*.bak
+
+# direnv
+.envrc
+.direnv/
+
+# IntelliJ module files
+*.iml
+
+# Certificates/keys (avoid committing secrets)
+*.pem
+*.key
+*.crt
+
+# Local analysis outputs
+analysis_results.txt
