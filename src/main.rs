@@ -144,9 +144,6 @@ struct MemoryItem {
 fn memory_dir() -> &'static str {
     "./_architect_ai"
 }
-fn proposal_path() -> &'static str {
-    "./_architect_ai/proposal.json"
-}
 fn patch_path() -> &'static str {
     "./_architect_ai/patch.diff"
 }
@@ -239,11 +236,8 @@ fn origin_url(root: &Path) -> Result<String> {
 fn https_url_from_remote(remote: &str) -> Option<String> {
     if remote.starts_with("https://") {
         Some(remote.to_string())
-    } else if remote.starts_with("git@github.com:") {
-        let tail = &remote["git@github.com:".len()..];
-        Some(format!("https://github.com/{tail}"))
     } else {
-        None
+        remote.strip_prefix("git@github.com:").map(|tail| format!("https://github.com/{tail}"))
     }
 }
 
@@ -481,7 +475,7 @@ impl shuttle_runtime::Service for MyService {
         
         // Validate the cron schedule
         config.validate_cron_schedule()
-            .map_err(|e| shuttle_runtime::Error::Custom(anyhow::Error::msg(e).into()))?;
+            .map_err(|e| shuttle_runtime::Error::Custom(anyhow::Error::msg(e)))?;
 
         info!("📅 Using cron schedule: {}", config.cron_schedule);
         let schedule = Schedule::from_str(&config.cron_schedule)

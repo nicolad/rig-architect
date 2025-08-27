@@ -1,7 +1,56 @@
---- a/src/config.rs
-+++ b/src/config.rs
-@@ -1,3 +1,4 @@
-+/// Application configuration settings
- pub struct Config {
-     pub database_url: String,
-     pub port: u16,
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,4 +1,5 @@
+ //! AI Architecture Improver - Automated Tiny Improvements
++use anyhow::anyhow;
+ use std::{
+     env,
+     fs,
+@@ -523,6 +524,16 @@ fn sanitize_for_log(s: &str) -> String {
+         .into_owned()
+ }
+ 
++// Helper function to parse JSON from AI response, handling markdown fences
++fn parse_ai_response_json<T: for<'a> Deserialize<'a>>(response: &str) -> Result<T, anyhow::Error> {
++    let raw = response.trim().trim_start_matches("```json").trim_end_matches("```").trim();
++    serde_json::from_str(raw).or_else(|_| {
++        let json_start = raw.find('{').unwrap_or(0);
++        let json_end = raw.rfind('}').map(|i| i + 1).unwrap_or(raw.len());
++        serde_json::from_str(&raw[json_start..json_end])
++    }).map_err(|e| anyhow!("JSON parsing error: {}", e))
++}
++
+ // ============================================================================
+ // AI Tools (Simple text-based helpers)
+ // ============================================================================
+@@ -744,13 +755,7 @@ async fn run_architecture_analysis() -> Result<()> {
+     );
+ 
+     // Parse JSON response directly
+-    let raw = resp.trim().trim_start_matches("```json").trim_end_matches("```").trim();
+-    let proposal: ProposedChange = serde_json::from_str(raw)
+-        .or_else(|_| {
+-            // Try to extract JSON from response
+-            let json_start = raw.find('{').unwrap_or(0);
+-            let json_end = raw.rfind('}').map(|i| i + 1).unwrap_or(raw.len());
+-            serde_json::from_str(&raw[json_start..json_end])
+-        })
++    let proposal: ProposedChange = parse_ai_response_json(&resp)
+         .context("Could not parse proposal JSON from response")?;
+ 
+     info!("📝 Proposal: {}", proposal.title);
+@@ -810,13 +815,7 @@ async fn run_architecture_analysis() -> Result<()> {
+     let audit_resp = auditor.prompt(&audit_input).await.context("auditor failed")?;
+     
+     // Parse audit response
+-    let audit_json = audit_resp.trim().trim_start_matches("```json").trim_end_matches("```").trim();
+-    let verdict: AuditVerdict = serde_json::from_str(audit_json)
+-        .or_else(|_| {
+-            let json_start = audit_json.find('{').unwrap_or(0);
+-            let json_end = audit_json.rfind('}').map(|i| i + 1).unwrap_or(audit_json.len());
+-            serde_json::from_str(&audit_json[json_start..json_end])
+-        })
++    let verdict: AuditVerdict = parse_ai_response_json(&audit_resp)
+         .unwrap_or_else(|_| AuditVerdict {
+             ok: false,
+             best_practice_score: 0.5,
