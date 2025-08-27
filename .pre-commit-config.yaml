@@ -1,0 +1,55 @@
+# Pre-commit configuration for rig-architect
+# Install with: pip install pre-commit && pre-commit install
+
+repos:
+  # Rust-specific hooks
+  - repo: https://github.com/doublify/pre-commit-rust
+    rev: v1.0
+    hooks:
+      - id: fmt
+        name: cargo fmt
+        description: Format Rust code with cargo fmt
+      - id: clippy
+        name: cargo clippy
+        description: Lint Rust code with cargo clippy
+        args: ["--all-targets", "--all-features", "--", "-D", "warnings"]
+      - id: cargo-check
+        name: cargo check
+        description: Check if Rust code compiles
+
+  # General hooks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.4.0
+    hooks:
+      - id: trailing-whitespace
+        name: Remove trailing whitespace
+      - id: end-of-file-fixer
+        name: Fix end of files
+      - id: check-yaml
+        name: Check YAML syntax
+      - id: check-toml
+        name: Check TOML syntax
+      - id: check-merge-conflict
+        name: Check for merge conflicts
+      - id: check-added-large-files
+        name: Check for large files
+        args: ["--maxkb=1000"]
+      - id: mixed-line-ending
+        name: Check line endings
+
+  # Security scanning
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.4.0
+    hooks:
+      - id: detect-secrets
+        name: Detect secrets
+        args: ["--baseline", ".secrets.baseline"]
+        exclude: ^Secrets\.toml$
+
+  # Markdown and documentation
+  - repo: https://github.com/igorshubovych/markdownlint-cli
+    rev: v0.37.0
+    hooks:
+      - id: markdownlint
+        name: Lint Markdown files
+        args: ["--fix"]

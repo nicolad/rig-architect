@@ -1,63 +1,60 @@
 [package]
-name = "rig_bug_finder"
+name = "ai_architect"
 version = "0.1.0"
 edition = "2021"
-default-run = "rig_bug_finder"
-
-[[bin]]
-name = "rig_bug_finder"
-path = "src/main.rs"
+description = "AI-powered architecture analysis and generation tool"
+authors = ["Vadim Nicolai <nicolai.vadim@gmail.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nicolad/rig-architect"
 
 [dependencies]
+# Core async runtime and utilities
 anyhow = "1"
-apalis = "0.5"
-apalis-cron = "0.5"
-cargo_metadata = "0.18"
-chrono = { version = "0.4", features = ["serde"] }
-dotenvy = "0.15"
-env_logger = "0.11"
-fs_extra = "1.3"
-futures = "0.3"
-log = "0.4"
-pathdiff = "0.2"
-rayon = "1.8"
-regex = "1"
-reqwest = { version = "0.12", features = ["json"] }
-rig = { package = "rig-core", version = "0.18.2", features = ["derive"] }
-rig-fastembed = "0.2.9"
-fastembed = "4.0"
-rig-sqlite = "0.1"
-rusqlite = { version = "0.32", features = ["bundled"] }
-rustls = { version = "0.23", features = ["ring"] }
-rmcp = { version = "0.6", features = ["client", "server", "macros", "transport-worker", "transport-streamable-http-server", "transport-streamable-http-client", "schemars", "reqwest"] }
-schemars = { version = "1.0", features = ["derive"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite"] }
-sqlite-vec = "0.1"
-tokio-rusqlite = "0.6"
-octocrab = "0.40"
-base64 = "0.22"
-tempfile = "3.8"
-bincode = "1.3"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "chrono", "json"] }
-axum = "0.7"
-hyper = "1.0"
-hyper-util = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Web service dependencies
+shuttle-runtime = "0.54.0"
+shuttle-axum = "0.54.0"
+axum = { version = "0.7", features = ["json", "multipart"] }
 tower = "0.5"
-walkdir = "2.4"
-ignore = "0.4"
-blake3 = "1"
-once_cell = "1.19"
+tower-http = { version = "0.6", features = ["cors", "fs"] }
+
+# Cron job dependencies
+apalis = { version = "0.6", features = ["retry"] }
+apalis-cron = "0.6"
+
+# AI and language model integration
+rig = { package = "rig-core", version = "0.18.2", features = ["rmcp"] }
+rig-derive = "0.1.5"
+
+# MCP integration (official Rust SDK)
+rmcp = { version = "0.6", features = ["transport-child-process", "client"] }
+schemars = "0.8"
+
+# CLI and file system utilities for architect improver
+clap = { version = "4", features = ["derive"] }
+walkdir = "2"
+regex = "1"
+percent-encoding = "2"
+
+# GitHub integration
+reqwest = { version = "0.12", features = ["json"] }
+base64 = "0.22"
+
+# Configuration and environment
+dotenvy = "0.15"
+
+# Date/time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [dev-dependencies]
 rstest = "0.21"
-which = "6.0"
 
 [profile.release]
 codegen-units = 1
-lto = true
-
-[workspace]

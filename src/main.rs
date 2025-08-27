@@ -1,1219 +1,768 @@
-// Main module for Rig Analyzer with rig-sqlite integration
-//
-// This implementation uses rig-sqlite for vector similarity search
-// + improved bug finding & false positive checks (parallel scan, .gitignore support,
-// hybrid FP filtering, persistent FP cache, dedup, and tunable thresholds)
+//! AI Architecture Improver - Automated Tiny Improvements
+//!
+//! This tool automatically finds, audits, and commits tiny architecture improvements
+//! using AI-powered analysis with ranking and memory systems.
 
-use anyhow::Result;
-use tracing::{debug, error, info, trace, warn};
+mod config;
 
-mod deepseek;
-mod false_positive_filter;
-mod mcp;
-pub mod patterns;
-mod vector_store;
-
-use crate::false_positive_filter::FalsePositiveFilter;
-use crate::false_positive_filter::{RigFpValidator, IssueView, Neighbor};
-use rig_bug_finder::{init_dev_logging, Config};
-use deepseek::DeepSeekClient;
-use mcp::run_mcp_server;
-use patterns::scan;
-use vector_store::VectorStoreManager;
-
-// ===== New imports for improvements =====
-use blake3;
-use futures::stream::{self, StreamExt};
-use ignore::WalkBuilder;
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
+use std::{
+    env,
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+    str::FromStr,
 };
-use tokio::fs as aiofs;
-use tokio::sync::{Mutex, Semaphore};
 
-// ---------- FP Cache ----------
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct FpCacheEntry {
-    /// Stable fingerprint: pattern_id | relative_path | line | blake3(excerpt)
-    issue_key: String,
-    file_hash: String,         // blake3(file bytes)
-    is_false_positive: bool,   // final decision
-    confidence: f32,           // AI confidence (0.0..1.0) or heuristic 1.0
-    decided_by: String,        // "heuristics" | "ai" | "mixed"
-    reasoning: Option<String>, // why it was marked FP
-    last_seen_ts: String,      // UTC timestamp string
+use anyhow::{anyhow, Context, Result};
+use apalis::layers::retry::RetryPolicy;
+use apalis::prelude::*;
+use apalis_cron::CronStream;
+use apalis_cron::Schedule;
+use chrono::{DateTime, Utc};
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn};
+use walkdir::WalkDir;
+
+use rig::{
+    client::CompletionClient,
+    completion::Prompt,
+    providers::deepseek,
+    vector_store::in_memory_store::InMemoryVectorStore,
+};
+
+use config::Config;
+
+// ============================================================================
+// Cron Job Data Structure
+// ============================================================================
+
+#[derive(Clone)]
+struct ArchitectService {
+    message: String,
+}
+
+impl ArchitectService {
+    fn new() -> Self {
+        Self {
+            message: "AI Architecture Improver".to_string(),
+        }
+    }
+    
+    async fn execute(&self, _item: ArchitectReminder) -> Result<()> {
+        info!("{} - Starting architecture analysis", &self.message);
+        run_architecture_analysis().await
+    }
 }
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
-struct FpCache {
-    map: HashMap<String, FpCacheEntry>,
-}
+struct ArchitectReminder(DateTime<Utc>);
 
-impl FpCache {
-    async fn load(path: &Path) -> Self {
-        if let Ok(bytes) = aiofs::read(path).await {
-            if let Ok(cache) = serde_json::from_slice::<FpCache>(&bytes) {
-                return cache;
-            }
-        }
-        FpCache::default()
-    }
-
-    async fn save(&self, path: &Path) -> Result<()> {
-        if let Some(dir) = path.parent() {
-            aiofs::create_dir_all(dir).await?;
-        }
-        let bytes = serde_json::to_vec_pretty(self)?;
-        aiofs::write(path, bytes).await?;
-        Ok(())
-    }
-
-    fn get(&self, key: &str) -> Option<&FpCacheEntry> {
-        self.map.get(key)
-    }
-
-    fn put(&mut self, entry: FpCacheEntry) {
-        self.map.insert(entry.issue_key.clone(), entry);
+impl From<DateTime<Utc>> for ArchitectReminder {
+    fn from(t: DateTime<Utc>) -> Self {
+        ArchitectReminder(t)
     }
 }
 
-// ---------- Utilities ----------
-fn is_excluded_dir_component(c: &str) -> bool {
-    matches!(
-        c,
-        ".git"
-            | "target"
-            | "node_modules"
-            | "__pycache__"
-            | "build"
-            | "dist"
-            | "tests"
-            | "test"
-            | "benches"
-            | "benchmarks"
-            | "benchmark"
-            | "fixtures"
-            | "mocks"
-            | "vendor"
-            | "third_party"
-            | "generated"
-            | "gen"
-            | "out"
-            | "tmp"
-            | "cache"
+// ============================================================================
+// Configuration (No CLI - Environment Variables)
+// ============================================================================
+// Configuration (Now imported from config.rs)
+// ============================================================================
+
+// ============================================================================
+// Rank / Profile System
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Profile {
+    rank: Rank,
+    success_streak: u32,
+    total_success: u32,
+    total_runs: u32,
+    rolling_avg: f32,
+    last_promo_ts: String,
+}
+
+impl Default for Profile {
+    fn default() -> Self {
+        Self {
+            rank: Rank::Junior,
+            success_streak: 0,
+            total_success: 0,
+            total_runs: 0,
+            rolling_avg: 0.0,
+            last_promo_ts: Utc::now().to_rfc3339(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum Rank {
+    Junior,
+    Mid,
+    Senior,
+}
+
+// ============================================================================
+// Structured Outputs
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProposedChange {
+    title: String,
+    rationale: String,
+    patch: String,
+    estimated_changed_lines: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AuditVerdict {
+    ok: bool,
+    best_practice_score: f32,
+    security_ok: bool,
+    secret_leak_risk: bool,
+    vuln_risk: bool,
+    comments: Vec<String>,
+}
+
+// ============================================================================
+// Memory System
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MemoryItem {
+    ts: String,
+    title: String,
+    summary: String,
+    rank: Rank,
+    score: f32,
+}
+
+fn memory_dir() -> &'static str {
+    "./_architect_ai"
+}
+fn proposal_path() -> &'static str {
+    "./_architect_ai/proposal.json"
+}
+fn patch_path() -> &'static str {
+    "./_architect_ai/patch.diff"
+}
+fn memory_file() -> &'static str {
+    "./_architect_ai/memory.jsonl"
+}
+fn profile_file() -> &'static str {
+    "./_architect_ai/profile.json"
+}
+
+fn load_profile() -> Profile {
+    fs::read_to_string(profile_file())
+        .ok()
+        .and_then(|s| serde_json::from_str::<Profile>(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_profile(p: &Profile) -> Result<()> {
+    fs::create_dir_all(memory_dir()).ok();
+    fs::write(profile_file(), serde_json::to_vec_pretty(p)?)?;
+    Ok(())
+}
+
+fn load_memory() -> Vec<MemoryItem> {
+    fs::read_to_string(memory_file())
+        .map(|s| s.lines().filter_map(|l| serde_json::from_str(l).ok()).collect())
+        .unwrap_or_else(|_| vec![])
+}
+
+fn append_memory(item: &MemoryItem) -> Result<()> {
+    fs::create_dir_all(memory_dir()).ok();
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(memory_file())?;
+    use std::io::Write;
+    writeln!(f, "{}", serde_json::to_string(item)?)?;
+    Ok(())
+}
+
+async fn build_memory_index(
+    _ds: &deepseek::Client,
+    _items: &[MemoryItem],
+) -> Result<InMemoryVectorStore<String>> {
+    // For now, just return empty store since embedding model is not available in this version
+    let store = InMemoryVectorStore::default();
+    info!("Memory index initialized (basic mode)");
+    Ok(store)
+}
+
+// ============================================================================
+// Security & Git Helpers
+// ============================================================================
+
+fn likely_secret_present(s: &str) -> bool {
+    let aws = Regex::new(r"AKIA[0-9A-Z]{16}").unwrap();
+    let gh = Regex::new(r"gh[pousr]_[A-Za-z0-9]{24,}").unwrap();
+    let jwt = Regex::new(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9._-]{10,}\.[A-Za-z0-9._-]{10,}")
+        .unwrap();
+    let generic = Regex::new(
+        r#"(?i)(secret|api[_-]?key|token|password)\s*[:=]\s*['"][^'"\n]{12,}['"]"#,
+    )
+    .unwrap();
+    aws.is_match(s) || gh.is_match(s) || jwt.is_match(s) || generic.is_match(s)
+}
+
+fn run(cwd: &Path, prog: &str, args: &[&str]) -> Result<String> {
+    let out = Command::new(prog).args(args).current_dir(cwd).output()?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "{prog} {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+fn repo_root() -> Result<PathBuf> {
+    let out = run(Path::new("."), "git", &["rev-parse", "--show-toplevel"])?;
+    Ok(PathBuf::from(out.trim()))
+}
+
+fn origin_url(root: &Path) -> Result<String> {
+    Ok(run(root, "git", &["remote", "get-url", "origin"])?
+        .trim()
+        .into())
+}
+
+fn https_url_from_remote(remote: &str) -> Option<String> {
+    if remote.starts_with("https://") {
+        Some(remote.to_string())
+    } else if remote.starts_with("git@github.com:") {
+        let tail = &remote["git@github.com:".len()..];
+        Some(format!("https://github.com/{tail}"))
+    } else {
+        None
+    }
+}
+
+const USERINFO: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'@')
+    .add(b'\\')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}');
+
+fn enc(s: &str) -> String {
+    utf8_percent_encode(s, USERINFO).to_string()
+}
+
+fn changed_lines_in_patch(patch: &str) -> usize {
+    patch
+        .lines()
+        .filter(|l| {
+            (l.starts_with('+') || l.starts_with('-'))
+                && !l.starts_with("+++")
+                && !l.starts_with("---")
+        })
+        .count()
+}
+
+fn sanitize_for_log(s: &str) -> String {
+    Regex::new(r"[A-Za-z0-9_\-]{20,}\@[A-Za-z0-9\./:-]+")
+        .unwrap()
+        .replace_all(s, "***REDACTED***")
+        .into_owned()
+}
+
+// ============================================================================
+// AI Tools (Simple text-based helpers)
+// ============================================================================
+
+fn list_arch_files() -> Result<String> {
+    let root = env::current_dir()?;
+    let mut out = Vec::new();
+    for dent in WalkDir::new(&root) {
+        let e = dent?;
+        if !e.file_type().is_file() {
+            continue;
+        }
+        let p = e.path();
+        let rel = p
+            .strip_prefix(&root)
+            .unwrap_or(p)
+            .to_string_lossy()
+            .to_string();
+        // Focus on code files for self-improvement
+        let is_code = rel.ends_with(".rs")
+            || rel == "Cargo.toml" 
+            || rel == "README.md"
+            || rel.starts_with("src/")
+            || rel.ends_with(".toml")
+            || rel.ends_with(".md");
+        let ignore = rel.contains("/.git/")
+            || rel.contains("/target/")
+            || rel.contains("/node_modules/")
+            || rel.contains("/.cargo/");
+        if is_code && !ignore {
+            out.push(rel);
+        }
+    }
+    Ok(serde_json::to_string_pretty(&out).unwrap_or("[]".into()))
+}
+
+// ============================================================================
+// AI Prompts
+// ============================================================================
+
+fn improver_preamble(rank: &Rank, max_lines: usize, include: &str, exclude: &str, files: &str) -> String {
+    let scope = match rank {
+        Rank::Junior => "Aim for small code improvements: add missing docs, fix typos, add error handling, simple refactors.",
+        Rank::Mid => "You may refactor functions, improve error messages, add helper functions, reorganize imports.",
+        Rank::Senior => "You may create new modules, add advanced features, improve architecture within the line budget.",
+    };
+    format!(
+        r#"
+You are an AI Architect at **{rank}** level. Find EXACTLY ONE tiny improvement to this Rust codebase
+with the smallest blast radius. Keep changes within **{max_lines} lines** total.
+
+Available files:
+{files}
+
+Scope guidance: {scope}
+
+Examples of good improvements:
+- Add missing documentation comments
+- Improve error messages 
+- Add helper functions to reduce duplication
+- Create new utility modules (src/utils.rs, src/git.rs, etc.)
+- Add better logging or debug output
+- Improve function signatures or return types
+- Add configuration options
+- Small performance improvements
+
+Guardrails:
+- No breaking changes to public APIs
+- No secrets, credentials, or tokens in code
+- Ensure code compiles and tests pass
+- Focus on maintainability and readability
+- Focus includes: {include}
+- Avoid paths containing: {exclude}
+
+Output JSON format (respond with just the JSON, no fences):
+{{
+  "title": "...",
+  "rationale": "...", 
+  "patch": "<unified diff repo-relative>",
+  "estimated_changed_lines": <int|null>
+}}
+
+The unified diff MUST apply cleanly with 'git apply --check'.
+Make sure file paths in the diff are relative to the repo root.
+"#,
+        rank = match rank {
+            Rank::Junior => "junior",
+            Rank::Mid => "mid", 
+            Rank::Senior => "senior",
+        },
+        max_lines = max_lines,
+        include = if include.is_empty() { "(none)" } else { include },
+        exclude = if exclude.is_empty() { "(none)" } else { exclude },
+        files = files
     )
 }
 
-fn has_rust_extension(path: &Path) -> bool {
-    match path.extension().and_then(|s| s.to_str()) {
-        Some(ext) => Config::RUST_FILE_EXTENSIONS.contains(&ext),
-        None => false,
+fn auditor_preamble() -> String {
+    r#"
+You are a senior Rust code reviewer. Given a unified diff and post-patch files, return ONLY JSON:
+
+{
+  "ok": true|false,
+  "best_practice_score": 0..1,
+  "security_ok": true|false,
+  "secret_leak_risk": true|false,
+  "vuln_risk": true|false,
+  "comments": ["..."]
+}
+
+Heuristics:
+- Prefer clear documentation, proper error handling, good naming conventions.
+- Code must compile and follow Rust best practices.
+- No unsafe code without justification.
+- Absolutely no secrets/keys/tokens/passwords in code or comments.
+- Be conservative: if unsure, set ok=false and explain in comments.
+"#
+    .to_string()
+}
+
+fn mentor_preamble() -> String {
+    r#"
+You are a strict Rust mentor. Produce a single short line of feedback teaching the junior/mid developer
+what to improve next time (max 180 chars, no newlines, no JSON, no fences). Be concrete and kind.
+Focus on Rust best practices, code quality, and maintainability.
+"#
+    .to_string()
+}
+
+// ============================================================================
+// Leveling System
+// ============================================================================
+
+fn maybe_promote(p: &Profile) -> (bool, Rank) {
+    match p.rank {
+        Rank::Junior => {
+            if p.success_streak >= 3 && p.rolling_avg >= 0.90 {
+                return (true, Rank::Mid);
+            }
+        }
+        Rank::Mid => {
+            if p.success_streak >= 5 && p.rolling_avg >= 0.93 {
+                return (true, Rank::Senior);
+            }
+        }
+        Rank::Senior => {}
+    }
+    (false, p.rank.clone())
+}
+
+fn rank_slug(r: &Rank) -> &'static str {
+    match r {
+        Rank::Junior => "jr",
+        Rank::Mid => "mid",
+        Rank::Senior => "sr",
     }
 }
 
-fn file_component_excluded(path: &Path) -> bool {
-    path.components()
-        .filter_map(|c| c.as_os_str().to_str())
-        .any(is_excluded_dir_component)
+// ============================================================================
+// Cron Job Handler
+// ============================================================================
+
+async fn architect_cron_job(job: ArchitectReminder, svc: Data<ArchitectService>) {
+    info!("🕒 Cron job triggered at {:?}", job.0);
+    if let Err(e) = svc.execute(job).await {
+        warn!("❌ Architecture analysis failed: {}", e);
+    }
 }
 
-fn is_probably_comment(snippet: &str) -> bool {
-    let t = snippet.trim();
-    t.starts_with("//") || t.starts_with("/*") || t.ends_with("*/")
-}
+// ============================================================================
+// Shuttle Service Setup
+// ============================================================================
 
-fn blake3_hex(bytes: &[u8]) -> String {
-    let hash = blake3::hash(bytes);
-    hash.to_hex().to_string()
-}
-
-fn blake3_hex_of_str(s: &str) -> String {
-    blake3_hex(s.as_bytes())
-}
-
-// Compute a stable fingerprint for an issue
-fn issue_fingerprint(pattern_id: &str, relative_path: &str, line: usize, excerpt: &str) -> String {
-    let ex_hash = blake3_hex_of_str(excerpt);
-    format!("{pattern_id}|{relative_path}|{line}|{ex_hash}")
-}
-
-// Determine if we should trust AI FP result (hybrid guardrail)
-fn ai_says_false_positive(confidence: f32, threshold: f32) -> bool {
-    confidence >= threshold
-}
-
-/// Enhanced DeepSeek analysis for validated issues using multiple specialized methods
-async fn enhance_issue_with_deepseek(
-    deepseek_client: &DeepSeekClient,
-    issue: &patterns::Issue,
-    file_content: &str,
-    file_path: &str,
-) -> Result<String> {
-    let context = format!("File: {}, Pattern: {} ({}), Severity: {}", 
-                         file_path, issue.pattern_id, issue.category, issue.severity);
-
-    // Run multiple specialized analyses concurrently for comprehensive enhancement
-    let code_section = format!("// Code around line {}\n{}", issue.line, issue.excerpt);
+#[shuttle_runtime::main]
+async fn main() -> Result<MyService, shuttle_runtime::Error> {
+    dotenvy::dotenv().ok();
     
-    // Primary comprehensive analysis
-    let enhancement_prompt = format!(
-        "COMPREHENSIVE ISSUE ANALYSIS
-==============================
-
-File: {file_path}
-Location: Line {line}, Column {col}
-Pattern ID: {pattern_id}
-Category: {category}
-Severity: {severity}
-Issue Name: {name}
-
-Code Context:
-```rust
-{excerpt}
-```
-
-Full File Analysis Available: {file_size} characters
-
-Please provide a comprehensive analysis including:
-
-1. **SECURITY IMPACT**: Assess potential security vulnerabilities
-2. **BUSINESS LOGIC RISK**: Impact on critical systems, numerical calculations, or data integrity
-3. **PERFORMANCE IMPLICATIONS**: Memory usage, CPU impact, or scalability concerns
-4. **FIX RECOMMENDATIONS**: Specific code changes with examples
-5. **PREVENTION STRATEGIES**: How to avoid similar issues in the future
-6. **TESTING SUGGESTIONS**: Unit tests or integration tests to verify the fix
-7. **PRIORITY ASSESSMENT**: Immediate, urgent, or can be scheduled
-
-Focus specifically on Rust best practices, memory safety, and overall application reliability.
-Provide concrete, actionable recommendations.",
-        file_path = file_path,
-        line = issue.line,
-        col = issue.col,
-        pattern_id = issue.pattern_id,
-        category = issue.category,
-        severity = issue.severity,
-        name = issue.name,
-        excerpt = issue.excerpt,
-        file_size = file_content.len()
-    );
-
-    // Get the primary analysis
-    let primary_analysis = deepseek_client.analyze_code(&enhancement_prompt).await?;
-
-    // Get specialized analyses based on issue category and severity
-    let mut specialized_analyses = Vec::new();
+    info!("🚀 Initializing AI Architecture Improver Cron Service");
     
-    match issue.category.as_ref() {
-        "Security" | "Authentication" | "Authorization" | "Cryptography" => {
-            match deepseek_client.analyze_security(&code_section, &context).await {
-                Ok(security_analysis) => {
-                    specialized_analyses.push(format!("=== SPECIALIZED SECURITY ANALYSIS ===\n{}", security_analysis));
-                }
-                Err(e) => {
-                    debug!("Security analysis failed: {}", e);
-                }
-            }
-        }
-        "Performance" | "Memory" | "Concurrency" => {
-            match deepseek_client.analyze_performance(&code_section, &context).await {
-                Ok(perf_analysis) => {
-                    specialized_analyses.push(format!("=== SPECIALIZED PERFORMANCE ANALYSIS ===\n{}", perf_analysis));
-                }
-                Err(e) => {
-                    debug!("Performance analysis failed: {}", e);
-                }
-            }
-        }
-        _ => {
-            // For all other categories, run code quality analysis
-            match deepseek_client.analyze_code_quality(&code_section, &context).await {
-                Ok(quality_analysis) => {
-                    specialized_analyses.push(format!("=== SPECIALIZED CODE QUALITY ANALYSIS ===\n{}", quality_analysis));
-                }
-                Err(e) => {
-                    debug!("Code quality analysis failed: {}", e);
-                }
-            }
-        }
-    }
-
-    // For Critical and High severity issues, always include architectural analysis
-    if issue.severity == "Critical" || issue.severity == "High" {
-        match deepseek_client.analyze_architecture(&code_section, &context).await {
-            Ok(arch_analysis) => {
-                specialized_analyses.push(format!("=== ARCHITECTURAL IMPACT ANALYSIS ===\n{}", arch_analysis));
-            }
-            Err(e) => {
-                debug!("Architectural analysis failed: {}", e);
-            }
-        }
-
-        // Generate test cases for critical issues
-        match deepseek_client.generate_test_cases(&code_section, &context).await {
-            Ok(test_cases) => {
-                specialized_analyses.push(format!("=== GENERATED TEST CASES ===\n{}", test_cases));
-            }
-            Err(e) => {
-                debug!("Test case generation failed: {}", e);
-            }
-        }
-    }
-
-    // Combine all analyses into a comprehensive report
-    let mut final_analysis = format!(
-        "=== COMPREHENSIVE DEEPSEEK ANALYSIS ===\n\
-         Issue: {} ({})\n\
-         Severity: {} | Category: {}\n\
-         Location: {}:{}:{}\n\n\
-         === PRIMARY ANALYSIS ===\n\
-         {}\n",
-        issue.name, issue.pattern_id, issue.severity, issue.category,
-        file_path, issue.line, issue.col, primary_analysis
-    );
-
-    // Add specialized analyses
-    for analysis in specialized_analyses {
-        final_analysis.push_str(&format!("\n{}\n", analysis));
-    }
-
-    // Add metadata
-    final_analysis.push_str(&format!(
-        "\n=== ANALYSIS METADATA ===\n\
-         - Generated: {}\n\
-         - Analysis Methods: {} specialized methods\n\
-         - Total Analysis Length: {} characters\n\
-         - File Context: {} characters analyzed\n",
-        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
-        if issue.severity == "Critical" || issue.severity == "High" { "4-5" } else { "2-3" },
-        final_analysis.len(),
-        file_content.len()
-    ));
-
-    Ok(final_analysis)
+    Ok(MyService {})
 }
 
-/// Scan repository directories for pattern matches (improved)
-async fn scan_repository() -> Result<()> {
-    info!("🔍 Scanning repository for CRITICAL and HIGH pattern matches (excluding Panic patterns and test files, with hybrid false positive filtering)...");
-    let _start_time = std::time::Instant::now();
+// Customize this struct with things from `shuttle_main` needed in `bind`,
+// such as secrets or database connections
+struct MyService {}
 
-    // Focus scan on rig-core only (src/), while keeping relative paths from repo root
-    let repo_root = Config::rig_repo_path();
-    if !repo_root.exists() {
-        warn!("Repository path not found: {}", repo_root.display());
-        return Ok(());
+#[shuttle_runtime::async_trait]
+impl shuttle_runtime::Service for MyService {
+    async fn bind(self, _addr: std::net::SocketAddr) -> Result<(), shuttle_runtime::Error> {
+        info!("🔧 Setting up cron job service");
+
+        // Load configuration
+        let config = Config::from_env();
+        
+        // Validate the cron schedule
+        config.validate_cron_schedule()
+            .map_err(|e| shuttle_runtime::Error::Custom(anyhow::Error::msg(e).into()))?;
+
+        info!("📅 Using cron schedule: {}", config.cron_schedule);
+        let schedule = Schedule::from_str(&config.cron_schedule)
+            .map_err(|e| shuttle_runtime::Error::Custom(e.into()))?;
+
+        let architect_service = ArchitectService::new();
+
+        // Create in-memory cron stream (no database needed)
+        let cron_stream = CronStream::new(schedule);
+
+        // Create a worker that uses the architect service
+        let worker = WorkerBuilder::new("architect-improver")
+            .data(architect_service)
+            .retry(RetryPolicy::retries(3))
+            .backend(cron_stream)
+            .build_fn(architect_cron_job);
+
+        info!("🕒 Starting cron worker with schedule: {}", config.cron_schedule);
+        
+        // Start the worker
+        worker.run().await;
+
+        Ok(())
     }
-    // Primary scan root (rig-core under the repo root)
-    let mut scan_root = repo_root.join("rig-core/src");
-    if !scan_root.exists() {
-        // Fallback: if REPO_PATH mistakenly points to a nested folder, try its parent
-        if let Some(parent) = repo_root.parent() {
-            let alt = parent.join("rig-core/src");
-            if alt.exists() {
-                info!(
-                    "Adjusted scan root to parent rig-core: {} (REPO_PATH was: {})",
-                    alt.display(),
-                    repo_root.display()
-                );
-                scan_root = alt;
-            } else {
-                warn!(
-                    "rig-core path not found: {} (REPO_PATH: {}), nothing to scan",
-                    scan_root.display(),
-                    repo_root.display()
-                );
-                return Ok(());
-            }
-        } else {
-            warn!(
-                "rig-core path not found and no parent to try (REPO_PATH: {})",
-                repo_root.display()
-            );
-            return Ok(());
-        }
-    }
+}
+
+// ============================================================================
+// Core Analysis Logic (moved from main)
+// ============================================================================
+
+async fn run_architecture_analysis() -> Result<()> {
+    dotenvy::dotenv().ok();
+    
+    let config = Config::from_env();
+
+    info!("🚀 Starting AI Architecture Improver");
     info!(
-        "Scanning rig-core only under repo root: repo_root={} scan_root={}",
-        repo_root.display(),
-        scan_root.display()
+        "Config: max_lines={}, min_score={:.2}",
+        config.max_changed_lines, config.min_audit_avg
     );
 
-    // Configuration constants
-    let fp_confidence_threshold = 0.75;
-    let deepseek_concurrency = 3;
-    let scan_concurrency = {
-        let cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
-        (cores * 2).min(16).max(4)
-    };
-    let max_file_size_bytes = 2 * 1024 * 1024; // 2MB
+    // Provider
+    let api_key = env::var("DEEPSEEK_API_KEY")
+        .context("DEEPSEEK_API_KEY environment variable not set")?;
+    let ds = deepseek::Client::new(&api_key);
+    let chat_model =
+        env::var("DEEPSEEK_CHAT_MODEL").unwrap_or_else(|_| "deepseek-chat".to_string());
 
-    // Rig FP validator configuration
-    let borderline_low = 0.60;
-    let borderline_high = 0.80;
-    let context_radius = 24;
-    let neighbors_k = 3;
+    // Repo setup
+    let root = repo_root()?;
+    env::set_current_dir(&root)?;
+    fs::create_dir_all(memory_dir()).ok();
 
-    // Initialize Rig FP validator (always enabled)
-    let rig_fp_validator = match RigFpValidator::new(
-        fp_confidence_threshold,
-        borderline_low,
-        borderline_high,
-        context_radius,
-        neighbors_k,
-    ) {
-        Ok(validator) => {
-            info!("✅ Rig FP validator initialized successfully");
-            Some(Arc::new(validator))
-        }
-        Err(e) => {
-            warn!("⚠️ Failed to initialize Rig FP validator: {}. Falling back to legacy FP filter.", e);
-            None
-        }
-    };
+    // Profile + memory + index
+    let mut profile = load_profile();
+    let memory = load_memory();
+    let _store = build_memory_index(&ds, &memory).await?;
 
-    // Initialize false positive filter + rate limiter
-    let deepseek_client = DeepSeekClient::from_env().ok();
-    let ds_semaphore = Arc::new(Semaphore::new(deepseek_concurrency));
+    info!(
+        "👤 Current profile: rank={:?}, streak={}, avg={:.2}",
+        profile.rank, profile.success_streak, profile.rolling_avg
+    );
 
-    // Cache Git info once to avoid repeated spawning
-    let repo_branch = get_git_branch()
-        .await
-        .unwrap_or_else(|| "unknown".to_string());
-    let commit_hash = get_git_commit_hash()
-        .await
-        .unwrap_or_else(|| "unknown".to_string());
+    // Build Improver agent (simple approach)
+    let include = config.include.clone().unwrap_or_default();
+    let exclude = config.exclude.clone().unwrap_or_default();
+    
+    // Get available files
+    let files = list_arch_files().unwrap_or_else(|_| "[]".to_string());
 
-    // Persistent FP cache
-    let cache_path = Config::manifest_dir()
-        .join(".rig_cache")
-        .join("false_positive_cache.json");
-    let fp_cache = Arc::new(Mutex::new(FpCache::load(&cache_path).await));
-
-    // First pass: collect files to process (respect .gitignore)
-    info!("🔍 Collecting files to scan (respecting .gitignore)...");
-    let mut files_to_process: Vec<PathBuf> = Vec::new();
-
-    let walker = WalkBuilder::new(&scan_root)
-        .hidden(false)
-        .git_ignore(true)
-        .git_exclude(true)
-        .follow_links(true)
+    let improver = ds
+        .agent(&chat_model)
+        .preamble(&improver_preamble(
+            &profile.rank,
+            config.max_changed_lines,
+            &include,
+            &exclude,
+            &files,
+        ))
         .build();
 
-    for dent in walker {
-        let Ok(entry) = dent else { continue };
-        let path = entry.path();
-        if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-            continue;
-        }
-        if file_component_excluded(path) {
-            continue;
-        }
-        if !has_rust_extension(path) {
-            continue;
-        }
-        // Skip test files based on name patterns
-        let path_str = path.to_string_lossy();
-        if path_str.contains("_test.rs")
-            || path_str.ends_with("_tests.rs")
-            || path_str.contains("/test_")
-            || path_str.contains("/tests/")
-            || path_str.contains("/test/")
-        {
-            continue;
-        }
-        // Skip large files
-        if let Ok(meta) = std::fs::metadata(path) {
-            if meta.len() > max_file_size_bytes {
-                trace!(
-                    "Skipping large file (> {} B): {}",
-                    max_file_size_bytes,
-                    path.display()
-                );
-                continue;
-            }
-        }
-        files_to_process.push(path.to_path_buf());
-    }
+    // Ask for proposal.json
+    let resp = improver
+        .prompt("Propose one tiny improvement now. Follow the protocol strictly.")
+        .await?;
+    debug!("Improver said: {}", resp);
+    
+    // Parse JSON response directly
+    let raw = resp.trim().trim_start_matches("```json").trim_end_matches("```").trim();
+    let proposal: ProposedChange = serde_json::from_str(raw)
+        .or_else(|_| {
+            // Try to extract JSON from response
+            let json_start = raw.find('{').unwrap_or(0);
+            let json_end = raw.rfind('}').map(|i| i + 1).unwrap_or(raw.len());
+            serde_json::from_str(&raw[json_start..json_end])
+        })
+        .context("Could not parse proposal JSON from response")?;
 
-    let total_files = files_to_process.len();
-    info!("📊 Found {} Rust files to scan", total_files);
-    if total_files == 0 {
-        info!("✅ No files to scan.");
+    info!("📝 Proposal: {}", proposal.title);
+
+    // Safety rails pre-audit
+    let mut changed = proposal
+        .estimated_changed_lines
+        .unwrap_or_else(|| changed_lines_in_patch(&proposal.patch));
+    if changed == 0 {
+        changed = changed_lines_in_patch(&proposal.patch);
+    }
+    if changed > config.max_changed_lines {
+        warn!("Patch too large: {changed} > {}", config.max_changed_lines);
+        return Ok(());
+    }
+    if likely_secret_present(&proposal.patch) {
+        warn!("Local secret scan flagged the patch. Aborting.");
         return Ok(());
     }
 
-    let total_issues = Arc::new(AtomicUsize::new(0));
-    let scanned_files = Arc::new(AtomicUsize::new(0));
-    let filtered_false_positives = Arc::new(AtomicUsize::new(0));
-
-    // Dedup set for current run (avoid writing duplicate artifacts)
-    let seen_issue_keys: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-
-    // Process files in parallel with bounded concurrency
-    let repo_root_arc = Arc::new(repo_root.clone());
-    let info_every = std::cmp::min(50, std::cmp::max(1, total_files / 10));
-
-    stream::iter(files_to_process.into_iter().enumerate())
-        .map(|(file_index, path)| {
-            let repo_root = repo_root_arc.clone();
-            let fp_cache = fp_cache.clone();
-            let total_issues = total_issues.clone();
-            let scanned_files = scanned_files.clone();
-            let filtered_false_positives = filtered_false_positives.clone();
-            let seen_issue_keys = seen_issue_keys.clone();
-            let ds_semaphore = ds_semaphore.clone();
-            let deepseek_client = deepseek_client.clone();
-            let rig_fp_validator = rig_fp_validator.clone(); // Clone the Arc<RigFpValidator>
-            let mut fp_filter = FalsePositiveFilter::new(deepseek_client.clone());
-            let repo_branch = repo_branch.clone();
-            let commit_hash = commit_hash.clone();
-            async move {
-                let progress = file_index + 1;
-                let remaining = total_files - progress;
-                let percentage = ((progress as f64 / total_files as f64) * 100.0) as u32;
-
-                // Compute relative path (from repo root) once and reuse it everywhere below
-                let relative_path = pathdiff::diff_paths(&path, &*repo_root).unwrap_or(path.clone());
-                let relative_path_str = relative_path.to_string_lossy().to_string();
-
-                debug!(
-                    "📄 [{}/{}] ({:3}%) Scanning: {} (📁 {} remaining)",
-                    progress,
-                    total_files,
-                    percentage,
-                    &relative_path_str,
-                    remaining
-                );
-                trace!("Absolute path: {}", path.display());
-
-                if progress % info_every == 0 || progress == total_files {
-                    info!(
-                        "📊 Progress: {}/{} files processed ({:3}% complete, {} remaining)",
-                        progress, total_files, percentage, remaining
-                    );
-                }
-
-                // Read file (lossy UTF-8)
-                let content_bytes = match aiofs::read(&path).await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        warn!("Failed to read {}: {}", path.display(), e);
-                        return;
-                    }
-                };
-                let file_hash = blake3_hex(&content_bytes);
-                let content = String::from_utf8_lossy(&content_bytes).to_string();
-
-                scanned_files.fetch_add(1, Ordering::SeqCst);
-
-                let path_hash = blake3_hex(relative_path_str.as_bytes())[..10].to_string();
-                let file_stem = relative_path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-
-                let issues = scan(&content);
-
-                // Filter for Critical or High severity non-Panic (temporarily expanded for debugging)
-                let mut candidates: Vec<_> = issues
-                    .into_iter()
-                    .filter(|issue| {
-                        (issue.severity == "Critical" || issue.severity == "High") && issue.category != "Panic"
-                    })
-                    .collect();
-
-                if candidates.is_empty() {
-                    return;
-                }
-
-                let mut validated_non_fp = Vec::new();
-
-                for issue in candidates.drain(..) {
-                    // Stable issue key
-                    let key = issue_fingerprint(
-                        &issue.pattern_id,
-                        &relative_path_str,
-                        issue.line,
-                        &issue.excerpt,
-                    );
-
-                    // Dedup within this run
-                    {
-                        let mut seen = seen_issue_keys.lock().await;
-                        if !seen.insert(key.clone()) {
-                            trace!("Dedup (same run): {}", key);
-                            continue;
-                        }
-                    }
-
-                    // Heuristics first (cheap)
-                    let heuristics_fp = is_probably_comment(&issue.excerpt);
-
-                    // Consult cache
-                    let cached_decision = {
-                        let cache = fp_cache.lock().await;
-                        cache.get(&key).cloned()
-                    };
-
-                    if let Some(entry) = cached_decision {
-                        if entry.file_hash == file_hash {
-                            if entry.is_false_positive {
-                                filtered_false_positives.fetch_add(1, Ordering::SeqCst);
-                                info!(
-                                    "Filtered FP from cache {} (by: {}, conf: {:.2})",
-                                    issue.pattern_id, entry.decided_by, entry.confidence
-                                );
-                                // Write an informational FP artifact again (optional) – keep noise low: skip
-                                continue;
-                            } else {
-                                // Previously validated as real issue
-                                validated_non_fp.push((issue, None)); // None for no enhancement yet
-                                continue;
-                            }
-                        }
-                        // If file hash changed, fall through to re-eval
-                    }
-
-                    // Decide using heuristics + AI
-                    let mut is_fp = heuristics_fp;
-                    let mut decided_by = if heuristics_fp { "heuristics".to_string() } else { "unknown".to_string() };
-                    let mut confidence = if heuristics_fp { 1.0 } else { 0.0 };
-                    let mut reasoning: Option<String> = None;
-                    let mut deepseek_enhancement: Option<String> = None;
-
-                    // AI validation (Rig validator first, then enhanced DeepSeek analysis for all cases)
-                    if !is_fp {
-                        // Try Rig validator first (preferred method)
-                        if let Some(rig_validator) = &rig_fp_validator {
-                            let _permit = ds_semaphore.acquire().await.unwrap();
-                            
-                            // Create issue view for Rig validator
-                            let issue_view = IssueView {
-                                pattern_id: &issue.pattern_id,
-                                name: &issue.name,
-                                category: &issue.category,
-                                severity: &issue.severity,
-                                relative_path: &relative_path_str,
-                                line: issue.line,
-                                col: issue.col,
-                                excerpt: &issue.excerpt,
-                            };
-
-                            // Optional: gather neighbors from vector store (placeholder for now)
-                            let neighbors: Vec<Neighbor> = Vec::new(); // TODO: integrate with vector store if available
-
-                            // Run Rig validation
-                            let rig_result = rig_validator
-                                .validate(&issue_view, &content, &repo_branch, &commit_hash, &neighbors)
-                                .await;
-
-                            is_fp = rig_result.is_false_positive;
-                            decided_by = rig_result.decided_by.to_string();
-                            confidence = rig_result.confidence;
-                            reasoning = Some(rig_result.reasoning);
-                        }
-                        // Fallback to legacy DeepSeek validation if Rig validator unavailable
-                        else if deepseek_client.is_some() {
-                            // rate-limited
-                            let _permit = ds_semaphore.acquire().await.unwrap();
-                            match fp_filter.validate_issue(&issue, &content).await {
-                                Ok(validation) => {
-                                    if validation.is_false_positive
-                                        && ai_says_false_positive(validation.confidence, fp_confidence_threshold)
-                                    {
-                                        is_fp = true;
-                                        decided_by = "legacy_ai".to_string();
-                                        confidence = validation.confidence;
-                                        reasoning = Some(validation.reasoning.clone());
-                                    } else {
-                                        is_fp = false;
-                                        decided_by = "legacy_ai".to_string();
-                                        confidence = validation.confidence;
-                                        reasoning = Some(validation.reasoning.clone());
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!("Legacy validation failed for {}: {}", issue.pattern_id, e);
-                                    // keep as non-FP (fail-open to avoid hiding criticals)
-                                    is_fp = false;
-                                    decided_by = "ai_error".to_string();
-                                    confidence = 0.0;
-                                }
-                            }
-                        } else {
-                            trace!("No AI validation configured; skipping FP validation");
-                        }
-                    } else {
-                        reasoning = Some("Snippet appears to be a comment or block comment".into());
-                    }
-
-                    // Enhanced DeepSeek Analysis for all validated issues (not just FP checks)
-                    if !is_fp && deepseek_client.is_some() {
-                        let ds_client = deepseek_client.as_ref().unwrap();
-                        let _permit = ds_semaphore.acquire().await.unwrap();
-                        
-                        // Get comprehensive DeepSeek analysis for real issues
-                        match enhance_issue_with_deepseek(ds_client, &issue, &content, &relative_path_str).await {
-                            Ok(enhancement) => {
-                                info!(
-                                    "🤖 DeepSeek enhanced analysis for {} @ {}: {} chars",
-                                    issue.pattern_id,
-                                    &relative_path_str,
-                                    enhancement.len()
-                                );
-                                deepseek_enhancement = Some(enhancement);
-                            }
-                            Err(e) => {
-                                debug!("DeepSeek enhancement failed for {}: {}", issue.pattern_id, e);
-                            }
-                        }
-                    }
-
-                    // Update cache
-                    {
-                        let mut cache = fp_cache.lock().await;
-                        cache.put(FpCacheEntry {
-                            issue_key: key.clone(),
-                            file_hash: file_hash.clone(),
-                            is_false_positive: is_fp,
-                            confidence,
-                            decided_by: decided_by.clone(),
-                            reasoning: reasoning.clone(),
-                            last_seen_ts: chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string(),
-                        });
-                    }
-
-                    if is_fp {
-                        filtered_false_positives.fetch_add(1, Ordering::SeqCst);
-                        info!(
-                            "Filtered false positive {} [{}] (by: {}, conf: {:.2})",
-                            issue.pattern_id, relative_path_str, decided_by, confidence
-                        );
-
-                        // Skip saving false positive reports - just log them
-                        continue;
-                    }
-
-                    // Non-FP validated - store with enhancement
-                    validated_non_fp.push((issue, deepseek_enhancement));
-                }
-
-                if !validated_non_fp.is_empty() {
-                    info!(
-                        "Found {} CRITICAL/HIGH non-panic issues in: {}",
-                        validated_non_fp.len(),
-                        &relative_path_str
-                    );
-                    total_issues.fetch_add(validated_non_fp.len(), Ordering::SeqCst);
-
-                    // Store each validated issue as a bug report (enhanced with DeepSeek analysis)
-                    for (issue, deepseek_enhancement) in validated_non_fp {
-                        let bug_id = format!(
-                            "SCAN_{}_{}_{}_L{}",
-                            issue.pattern_id, file_stem, path_hash, issue.line
-                        );
-                        let bugs_dir = Config::manifest_dir().join(Config::BUGS_DIRECTORY);
-                        if let Err(e) = aiofs::create_dir_all(&bugs_dir).await {
-                            warn!("Failed to create bugs directory: {}", e);
-                            continue;
-                        }
-                        let bug_file = bugs_dir.join(format!("{}.json", bug_id));
-                        
-                        // Enhanced bug data with DeepSeek analysis
-                        let mut bug_data = serde_json::json!({
-                            "bug_id": bug_id,
-                            "file_name": file_stem,
-                            "analysis_context": "Automated pattern detection with AI enhancement",
-                            "description": format!("{} detected: {}", issue.category, issue.name),
-                            "severity": issue.severity,
-                            "file_location": {
-                                "relative_path": &relative_path_str,
-                                "line": issue.line,
-                                "column": issue.col
-                            },
-                            "code_sample": issue.excerpt,
-                            "pattern_id": issue.pattern_id,
-                            "fix_suggestion": format!("Review {} pattern usage", issue.category.to_lowercase()),
-                            "timestamp": chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string(),
-                            "workspace_info": {
-                                "repository": "repository",
-                                "branch": &repo_branch,
-                                "commit_hash": &commit_hash
-                            },
-                            "ai_powered": true,
-                            "deepseek_enhancement_available": deepseek_enhancement.is_some()
-                        });
-
-                        // Add DeepSeek enhancement if available
-                        if let Some(enhancement) = deepseek_enhancement {
-                            bug_data["deepseek_analysis"] = serde_json::Value::String(enhancement);
-                            bug_data["analysis_context"] = serde_json::Value::String("Automated pattern detection with comprehensive DeepSeek AI analysis".to_string());
-                        }
-
-                        if let Err(e) = aiofs::write(
-                            &bug_file,
-                            serde_json::to_string_pretty(&bug_data).unwrap_or_default(),
-                        )
-                        .await
-                        {
-                            warn!("Failed to write bug report: {}", e);
-                        } else {
-                            debug!("📝 Enhanced bug report saved: {}", bug_file.display());
-                        }
-                    }
-                }
+    // Check apply
+    fs::write(patch_path(), &proposal.patch)?;
+    
+    // Debug: show the patch content
+    debug!("Generated patch:\n{}", proposal.patch);
+    
+    // Try to apply the patch and provide better error info
+    match run(&root, "git", &["apply", "--check", patch_path()]) {
+        Ok(_) => info!("✅ Patch applies cleanly"),
+        Err(e) => {
+            warn!("❌ Patch failed to apply: {}", e);
+            // Show git status for debugging
+            if let Ok(status) = run(&root, "git", &["status", "--porcelain"]) {
+                debug!("Git status:\n{}", status);
             }
-        })
-        .buffer_unordered(scan_concurrency)
-        .collect::<Vec<()>>()
-        .await;
-
-    // Save FP cache
-    if let Err(e) = fp_cache.lock().await.save(&cache_path).await {
-        warn!("Failed to persist FP cache: {}", e);
+            // Show current working directory files
+            if let Ok(files) = list_arch_files() {
+                debug!("Available files: {}", files);
+            }
+            return Err(anyhow!("git apply --check failed: {}", e));
+        }
     }
+
+    // Apply + stage
+    run(&root, "git", &["apply", patch_path()]).context("git apply failed")?;
+    run(&root, "git", &["add", "-A"])?;
+
+    // Gather post-patch files for audit (only the staged ones)
+    let staged = run(&root, "git", &["diff", "--cached", "--name-only"])?;
+    let mut auditor_files = String::new();
+    for f in staged.lines() {
+        if let Ok(s) = fs::read_to_string(f) {
+            auditor_files.push_str(&format!("\n--- {}\n{}\n", f, s));
+        }
+    }
+
+    // Auditor - simple approach
+    let auditor = ds.agent(&chat_model).preamble(&auditor_preamble()).build();
+
+    let audit_input = format!(
+        "PATCH:\n{}\n\nFILES AFTER PATCH:\n{}\n",
+        proposal.patch, auditor_files
+    );
+    let audit_resp = auditor.prompt(&audit_input).await.context("auditor failed")?;
+    
+    // Parse audit response
+    let audit_json = audit_resp.trim().trim_start_matches("```json").trim_end_matches("```").trim();
+    let verdict: AuditVerdict = serde_json::from_str(audit_json)
+        .or_else(|_| {
+            let json_start = audit_json.find('{').unwrap_or(0);
+            let json_end = audit_json.rfind('}').map(|i| i + 1).unwrap_or(audit_json.len());
+            serde_json::from_str(&audit_json[json_start..json_end])
+        })
+        .unwrap_or_else(|_| AuditVerdict {
+            ok: false,
+            best_practice_score: 0.5,
+            security_ok: false,
+            secret_leak_risk: true,
+            vuln_risk: true,
+            comments: vec!["Failed to parse audit response".to_string()],
+        });
+        
+    let local_secret_flag =
+        likely_secret_present(&auditor_files) || likely_secret_present(&proposal.patch);
+    let avg_score = verdict.best_practice_score;
+    let safety_ok = verdict.ok
+        && verdict.security_ok
+        && !verdict.secret_leak_risk
+        && !verdict.vuln_risk
+        && !local_secret_flag;
 
     info!(
-        "✅ CRITICAL/HIGH (non-panic, non-test) pattern scanning complete. Scanned {} Rust files, found {} issues. Filtered false positives: {}",
-        scanned_files.load(Ordering::SeqCst),
-        total_issues.load(Ordering::SeqCst),
-        filtered_false_positives.load(Ordering::SeqCst),
+        "🔍 Audit → ok:{} best_practice:{:.2} safety_ok:{}",
+        verdict.ok, avg_score, safety_ok
     );
-    Ok(())
-}
+    debug!("Audit comments: {:?}", verdict.comments);
 
-/// Re-run dual validation (Rig extractor + legacy/pattern) on existing bug JSONs and annotate with `double_test`.
-async fn revalidate_existing_bugs() -> Result<()> {
-    use std::fs;
-    use std::path::PathBuf;
-
-    info!("🔁 Starting double revalidation over existing bug artifacts...");
-
-    let bugs_dir = Config::bugs_directory_path();
-    if !bugs_dir.exists() {
-        warn!("Bugs directory not found: {}", bugs_dir.display());
+    if avg_score < config.min_audit_avg || (config.strict_safety && !safety_ok) {
+        warn!(
+            "❌ Audit gate failed (avg={:.2}, safety_ok={}). Reverting.",
+            avg_score, safety_ok
+        );
+        run(&root, "git", &["reset", "--hard"]).ok();
+        profile.total_runs += 1;
+        profile.success_streak = 0;
+        profile.rolling_avg = (profile.rolling_avg * 0.9).max(0.15 * avg_score);
+        save_profile(&profile).ok();
         return Ok(());
     }
 
-    let mut entries: Vec<PathBuf> = fs::read_dir(&bugs_dir)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
-        .collect();
-    entries.sort();
+    // Commit & push
+    let user_name = env::var("GIT_USER_NAME").unwrap_or_else(|_| "architect-ai-improver".into());
+    let user_email = env::var("GIT_USER_EMAIL").unwrap_or_else(|_| "architect-ai@github.com".into());
+    
+    info!("🔧 Setting up Git config - user: {}, email: {}", user_name, user_email);
+    run(&root, "git", &["config", "user.name", &user_name])?;
+    run(&root, "git", &["config", "user.email", &user_email])?;
 
-    info!("Found {} bug JSONs to revalidate", entries.len());
+    let ts = Utc::now()
+        .format("%Y%m%d_%H%M%S")
+        .to_string()
+        .replace(':', "");
+    let branch = format!(
+        "{}/{}-{}",
+        config.branch_prefix.trim_end_matches('/'),
+        rank_slug(&profile.rank),
+        ts
+    );
+    
+    info!("🌿 Creating branch: {}", branch);
+    run(&root, "git", &["checkout", "-b", &branch])?;
 
-    // Initialize AI helpers
-    let deepseek_client = DeepSeekClient::from_env().ok();
-    let mut legacy = FalsePositiveFilter::new(deepseek_client.clone());
+    let commit_msg = format!(
+        "arch: {} [rank={:?} lines={} score={:.2}]\n\n{}\n\n[audited]\n",
+        proposal.title, profile.rank, changed, avg_score, proposal.rationale
+    );
+    
+    info!("💾 Committing changes");
+    run(&root, "git", &["commit", "-m", &commit_msg])?;
 
-    // Rig validator only if DEEPSEEK_API_KEY is set to avoid provider panic.
-    let rig_validator = if std::env::var("DEEPSEEK_API_KEY").is_ok() {
-        RigFpValidator::new(0.75, 0.60, 0.80, 24, 3).ok()
-    } else {
-        None
-    };
+    info!("🔑 Setting up authenticated push");
+    let token = env::var("GITHUB_TOKEN").map_err(|_| anyhow!("GITHUB_TOKEN not set"))?;
+    let remote = origin_url(&root)?;
+    let https =
+        https_url_from_remote(&remote).ok_or_else(|| anyhow!("Unsupported origin URL: {remote}"))?;
+    let push_url = https.replacen("https://", &format!("https://{}@", enc(&token)), 1);
+    
+    info!("⬆️ Pushing to {}", sanitize_for_log(&push_url));
+    run(&root, "git", &["push", "--set-upstream", &push_url, &branch])
+        .context("Failed to push to GitHub - check your GITHUB_TOKEN permissions")?;
 
-    for path in entries {
-        // Load JSON
-        let raw = match fs::read_to_string(&path) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("Failed to read {}: {}", path.display(), e);
-                continue;
-            }
-        };
-        let mut v: Value = match serde_json::from_str(&raw) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!("Failed to parse JSON {}: {}", path.display(), e);
-                continue;
-            }
-        };
-
-        // Extract minimal fields
-        let file_rel = v
-            .pointer("/file_location/relative_path")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string();
-        let line = v
-            .pointer("/file_location/line")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(1) as usize;
-        let col = v
-            .pointer("/file_location/column")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(1) as usize;
-        let severity = v
-            .pointer("/severity")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string();
-        let pattern_id = v
-            .pointer("/pattern_id")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string();
-        let code_sample = v
-            .pointer("/code_sample")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string();
-        let name = v
-            .pointer("/description")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        if file_rel.is_empty() {
-            warn!(
-                "{} missing file_location.relative_path; skipping",
-                path.display()
-            );
-            continue;
-        }
-
-        // Reconstruct absolute path from repo root
-        let repo_root = Config::rig_repo_path();
-        let abs = repo_root.join(&file_rel);
-        let content = match fs::read_to_string(&abs) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("Failed to read source {}: {}", abs.display(), e);
-                continue;
-            }
-        };
-
-        // Prepare issue view
-        let issue_view = IssueView {
-            pattern_id: &pattern_id,
-            name: &name,
-            category: "Unknown",
-            severity: &severity,
-            relative_path: &file_rel,
-            line,
-            col,
-            excerpt: &code_sample,
-        };
-
-        // Run Rig validator
-        let (rig_ok, rig_obj) = if let Some(rig) = &rig_validator {
-            let res = rig
-                .validate(
-                    &issue_view,
-                    &content,
-                    "revalidate",
-                    "revalidate",
-                    &Vec::<Neighbor>::new(),
-                )
-                .await;
-            let o = json!({
-                "is_false_positive": res.is_false_positive,
-                "confidence": res.confidence,
-                "reason": res.reasoning,
-                "decided_by": res.decided_by,
-            });
-            (true, o)
-        } else {
-            (false, json!({"error": "rig_validator_unavailable"}))
-        };
-
-        // Run legacy validator
-        let (legacy_ok, legacy_obj) = {
-            // We need Issue struct minimally; map fields
-            let issue = IssueShim {
-                pattern_id: pattern_id.clone(),
-                name: name.clone(),
-                category: "Unknown".into(),
-                severity: severity.clone(),
-                line,
-                col,
-                excerpt: code_sample.clone(),
-            };
-            match FalsePositiveFilter::validate_issue(&mut legacy, &issue.into_issue(), &content).await {
-                Ok(val) => {
-                    let o = json!({
-                        "is_false_positive": val.is_false_positive,
-                        "confidence": val.confidence,
-                        "reason": val.reasoning,
-                        "decided_by": if deepseek_client.is_some() { "legacy_ai" } else { "pattern_based" },
-                    });
-                    (true, o)
-                }
-                Err(e) => (false, json!({"error": format!("legacy_error: {}", e)})),
-            }
-        };
-
-        // Determine double confirmation: both available and both say not FP
-        let mut double_confirmed = false;
-        if rig_ok && legacy_ok {
-            let a = rig_obj
-                .get("is_false_positive")
-                .and_then(|x| x.as_bool())
-                .unwrap_or(false);
-            let b = legacy_obj
-                .get("is_false_positive")
-                .and_then(|x| x.as_bool())
-                .unwrap_or(false);
-            double_confirmed = !a && !b;
-        }
-
-        // Attach results
-        v["double_test"] = json!({
-            "rig": rig_obj,
-            "legacy": legacy_obj,
-            "double_confirmed": double_confirmed,
-        });
-
-        // Persist
-        if let Err(e) = fs::write(&path, serde_json::to_string_pretty(&v)? ) {
-            warn!("Failed to write {}: {}", path.display(), e);
-        } else {
-            debug!("Updated {}", path.display());
-        }
-    }
-
-    info!("✅ Double revalidation complete");
-    Ok(())
-}
-
-// Minimal shim to construct a patterns::Issue for legacy validator
-#[derive(Clone)]
-struct IssueShim {
-    pattern_id: String,
-    name: String,
-    category: String,
-    severity: String,
-    line: usize,
-    col: usize,
-    excerpt: String,
-}
-
-impl IssueShim {
-    fn into_issue(self) -> patterns::Issue {
-        patterns::Issue {
-            pattern_id: Box::leak(self.pattern_id.into_boxed_str()),
-            name: Box::leak(self.name.into_boxed_str()),
-            severity: Box::leak(self.severity.into_boxed_str()),
-            category: Box::leak(self.category.into_boxed_str()),
-            line: self.line,
-            col: self.col,
-            excerpt: self.excerpt,
-            severity_confirmed: true,
-            confidence_score: 0.9,
-        }
-    }
-}
-
-// Helper function to get current git branch
-async fn get_git_branch() -> Option<String> {
-    let output = tokio::process::Command::new("git")
-        .args(["branch", "--show-current"])
-        .output()
+    // Mentor feedback (one-liner) → append to memory
+    let mentor = ds.agent(&chat_model).preamble(&mentor_preamble()).build();
+    let mentor_note = mentor
+        .prompt(&format!(
+            "Rank: {:?}\nTitle: {}\nRationale: {}\nAudit score: {:.2}\n",
+            profile.rank, proposal.title, proposal.rationale, avg_score
+        ))
         .await
-        .ok()?;
+        .unwrap_or_else(|_| "Focus on crisp NFRs and verifiable SLOs.".to_string());
 
-    if output.status.success() {
-        String::from_utf8(output.stdout)
-            .ok()
-            .map(|s| s.trim().to_string())
-    } else {
-        None
-    }
-}
+    append_memory(&MemoryItem {
+        ts: Utc::now().to_rfc3339(),
+        title: proposal.title.clone(),
+        summary: mentor_note,
+        rank: profile.rank.clone(),
+        score: avg_score,
+    })
+    .ok();
 
-// Helper function to get current git commit hash
-async fn get_git_commit_hash() -> Option<String> {
-    let output = tokio::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .await
-        .ok()?;
+    // Leveling logic (EMA + streak gates)
+    profile.total_runs += 1;
+    profile.total_success += 1;
+    profile.success_streak += 1;
+    profile.rolling_avg = 0.85 * profile.rolling_avg + 0.15 * avg_score;
 
-    if output.status.success() {
-        String::from_utf8(output.stdout)
-            .ok()
-            .map(|s| s.trim().to_string())
-    } else {
-        None
-    }
-}
-
-pub struct UnifiedServerState {
-    pub vector_store: Option<VectorStoreManager>,
-    pub deepseek_client: Option<DeepSeekClient>,
-}
-
-impl UnifiedServerState {
-    pub async fn new() -> Result<Self> {
-        info!("🚀 Initializing Unified Server State with FastEmbed and DeepSeek...");
-        debug!("Starting initialization of vector store and AI client components");
-
-        // Initialize vector store with FastEmbed (no API key required)
-        trace!("Attempting to initialize vector store with FastEmbed local embeddings");
-        let vector_store = match VectorStoreManager::new().await {
-            Ok(store) => {
-                info!("✅ Vector store initialized with FastEmbed local embeddings");
-                debug!("Vector store ready for similarity search operations");
-                Some(store)
-            }
-            Err(e) => {
-                error!("❌ Failed to initialize vector store: {}", e);
-                warn!("⚠️ Vector similarity search will be unavailable");
-                None
-            }
-        };
-
-        // Initialize DeepSeek client
-        trace!("Attempting to initialize DeepSeek AI client from environment variables");
-        let deepseek_client = match DeepSeekClient::from_env() {
-            Ok(client) => {
-                info!("✅ DeepSeek client initialized from environment");
-                debug!("Testing DeepSeek API connection...");
-                // Test the connection
-                match client.validate_connection().await {
-                    Ok(_) => {
-                        info!("✅ DeepSeek API connection validated successfully");
-                        debug!("DeepSeek client ready for code analysis operations");
-                        Some(client)
-                    }
-                    Err(e) => {
-                        error!("❌ DeepSeek API connection failed: {}", e);
-                        warn!("⚠️ DeepSeek client available but connection unreliable");
-                        Some(client) // Keep client even if validation fails
-                    }
-                }
-            }
-            Err(e) => {
-                error!("❌ Failed to initialize DeepSeek client: {}", e);
-                warn!("⚠️ AI code analysis will be unavailable");
-                None
-            }
-        };
-
-        debug!("Unified server state initialization complete");
-        Ok(Self {
-            vector_store,
-            deepseek_client,
-        })
-    }
-}
-
-
-
-// Test functions removed - use scan_repository for real file analysis
-
-// Main function to run the rig application with FastEmbed and DeepSeek
-async fn run_rig_sqlite_application() -> Result<()> {
-    info!("🎯 Starting Rig Analyzer application with AI integration");
-    println!("🎯 Starting Rig Analyzer with FastEmbed and DeepSeek integration");
-    println!("=======================================================================");
-    debug!("Application startup initiated with comprehensive AI toolchain");
-
-    println!("\n✅ FastEmbed + DeepSeek integration initialized successfully!");
-    info!("🎉 Integration initialization complete");
-
-    // Run automated bug analysis using repository scanning on real files
-    debug!("Starting automated bug analysis on repository files");
-    scan_repository().await?;
-
-    // After scanning, re-run double validation to annotate bug JSONs
-    debug!("Starting double revalidation of bug artifacts");
-    if let Err(e) = revalidate_existing_bugs().await {
-        warn!("Double revalidation failed: {}", e);
+    let (promoted, new_rank) = maybe_promote(&profile);
+    if promoted {
+        profile.rank = new_rank;
+        profile.success_streak = 0;
+        profile.last_promo_ts = Utc::now().to_rfc3339();
+        info!("🏅 Promoted to {:?}", profile.rank);
     }
 
-    info!("✅ Application operations complete");
-    Ok(())
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Load environment variables from .env file FIRST (before any client initialization)
-    // Try absolute path first, then relative paths
-    let env_paths = [
-        Config::manifest_dir().join(".env"),
-        std::path::Path::new(".env").to_path_buf(),
-        std::path::Path::new("nautilus-trader-rig/.env").to_path_buf(),
-    ];
-
-    for env_path in &env_paths {
-        if env_path.exists() {
-            dotenvy::from_path(env_path).ok();
-            break;
-        }
-    }
-
-    // Initialize centralized logging system
-    init_dev_logging()?;
-
-    // Log environment file status
-    debug!("Environment file path: {}", Config::ENV_FILE_PATH);
-    debug!("Environment file exists: {}", Config::env_file_exists());
-    if let Ok(api_key) = std::env::var("DEEPSEEK_API_KEY") {
-        debug!("DEEPSEEK_API_KEY loaded (length: {} chars)", api_key.len());
-    } else {
-        warn!("DEEPSEEK_API_KEY not found in environment");
-    }
-
-    // Log rig repository configuration
-    if let Some(rig_path) = Config::rig_repo_path_env_value() {
-        info!("REPO_PATH set to: {}", rig_path);
-        debug!("Using rig repository from environment variable");
-    } else {
-        let default_path = Config::rig_repo_path();
-        info!(
-            "REPO_PATH not set, using default: {}",
-            default_path.display()
-        );
-        debug!("Using default rig repository path");
-    }
-
-    info!("🚀 Starting Rig Analyzer with MCP server...");
-    debug!("Application entry point - initializing concurrent services");
-
-    // Check configuration paths at startup
-    info!("ℹ️ Validating repository configuration");
-    let repo_path = Config::rig_repo_path();
-    let exists = repo_path.exists();
-    let status = if exists { "Found" } else { "Missing" };
-    tracing::info!("📁 Repository path check: {:?} ({})", repo_path, status);
-
-    if exists {
-        info!("✅ Repository path is accessible for scanning");
-    } else {
-        warn!("⚠️ Repository path does not exist: {}", repo_path.display());
-    }
-
-    // Start MCP server on a separate thread
-    debug!("Spawning MCP server on background thread");
-    let _mcp_handle = tokio::spawn(async {
-        info!("🌐 Starting MCP server thread");
-        if let Err(e) = run_mcp_server().await {
-            error!("❌ MCP server failed: {}", e);
-        } else {
-            info!("✅ MCP server completed successfully");
-        }
-    });
-
-    // Run the main application
-    debug!("Starting main application thread");
-    if let Err(e) = run_rig_sqlite_application().await {
-        error!("❌ Main application failed: {}", e);
-        return Err(e);
-    }
-
-    info!("✅ Application shutdown complete");
+    save_profile(&profile).ok();
+    info!("✅ Success! Branch: {}", branch);
     Ok(())
 }

@@ -1,15 +1,25 @@
 # Rust build artifacts
 /target/
 
-# Local clone of external repo
-/nautilus_trader/
-
-# Autopatcher backup files
-.autopatch_backups/
+# AI Architecture output
+/architecture_out/
 
 # Logs
+*.log
 /logs/
-/.logs/
+
+# Environment files
+.env
+.env.*
+
+# Databases and local state
+*.db
+*.sqlite
+*.sqlite3
+
+# FastEmbed/AI model cache
+.fastembed_cache/
+/models/
 
 # macOS
 .DS_Store
@@ -17,22 +27,7 @@
 # Editors/IDEs
 .vscode/
 .idea/
-.fastembed_cache
-# FastEmbed/HF models cache
-.fastembed_cache/
-/models/
-
-# Databases and local state
-*.db
-*.sqlite
-*.sqlite3
-
-# Env files
-.env
-.env.*
-
-# Logs
-*.log
+*.iml
 
 # Editor/OS backups and swap files
 *~
@@ -45,9 +40,6 @@
 .envrc
 .direnv/
 
-# IntelliJ module files
-*.iml
-
 # Certificates/keys (avoid committing secrets)
 *.pem
 *.key
@@ -55,3 +47,9 @@
 
 # Local analysis outputs
 analysis_results.txt
+/target
+.shuttle*
+Secrets*.toml
+
+# Static files
+static/index.html
