@@ -605,9 +605,30 @@ fn list_arch_files() -> Result<String> {
 
 /// Collect recent patch failure patterns from stdout/logs to detect self-improvement needs
 fn collect_recent_patch_failures() -> Option<String> {
-    // In a real implementation, this would read from log files or stdout capture
-    // For now, return a simple indicator that patch failures are happening
-    Some("Recent patch failures detected: corrupt patch errors, PATCH_CHECK failures".to_string())
+    // Read recent failures from execution log
+    if let Ok(log_content) = fs::read_to_string("_architect_ai/execution.log") {
+        let recent_lines: Vec<&str> = log_content
+            .lines()
+            .rev()
+            .take(200) // Last 200 lines
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        
+        let recent_log = recent_lines.join("\n");
+        
+        // Look for failure patterns
+        let has_failures = recent_log.contains("FAILED")
+            || recent_log.contains("corrupt patch")
+            || recent_log.contains("could not compile")
+            || recent_log.contains("error[E0");
+            
+        if has_failures {
+            return Some(recent_log);
+        }
+    }
+    None
 }
 
 // ============================================================================
@@ -644,21 +665,35 @@ fn improver_preamble(
         .map(|logs| {
             let has_corruption = logs.contains("corrupt patch")
                 || logs.contains("PATCH_CHECK") && logs.contains("FAILED");
-            if has_corruption {
-                info!("🔧 SELF-IMPROVEMENT TRIGGERED: Detected patch corruption patterns");
+            let has_compilation_errors = logs.contains("could not compile")
+                || logs.contains("error[E0")
+                || logs.contains("❌ Code does not compile");
+            let has_failures = has_corruption || has_compilation_errors;
+            
+            if has_failures {
+                if has_compilation_errors {
+                    info!("🔧 SELF-IMPROVEMENT TRIGGERED: Detected compilation failures from AI changes");
+                } else {
+                    info!("🔧 SELF-IMPROVEMENT TRIGGERED: Detected patch corruption patterns");
+                }
             }
-            has_corruption
+            has_failures
         })
         .unwrap_or(false);
 
     let priority_guidance = if self_improvement_needed {
-        info!("🎯 Applying priority guidance for patch system fixes");
-        "\n🔧 PRIORITY: Multiple patch corruption failures detected. Focus on fixing the patch generation system itself:\n\
-         - Improve patch format validation\n\
+        info!("🎯 Applying priority guidance for system fixes");
+        "\n🔧 PRIORITY: System failures detected. Focus on fixing core issues:\n\
+         - Fix compilation errors from incorrect imports/syntax\n\
+         - Improve patch format validation and generation\n\
          - Fix git working directory cleanup\n\
-         - Enhance diff generation logic\n\
-         - Add better error recovery\n\
-         Target: src/main.rs patch generation functions\n"
+         - Enhance diff generation logic with proper context\n\
+         - Add better error recovery and rollback\n\
+         - Validate changes before committing\n\
+         Target: src/main.rs core functions\n\
+         \n\
+         CRITICAL: Always verify imports exist before changing them!\n\
+         CRITICAL: Test compilation before generating patches!\n"
     } else {
         ""
     };
