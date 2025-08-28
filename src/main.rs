@@ -843,16 +843,16 @@ async fn run_architecture_analysis() -> Result<()> {
         }
         Err(e) => {
             warn!("❌ Failed to read src/main.rs: {}", e);
-            // Try absolute path
-            match fs::read_to_string("/Users/vadimnicolai/Public/ai/rig/rig-architect/src/main.rs") {
+            // Try from repository root
+            match fs::read_to_string("./src/main.rs") {
                 Ok(content) => {
                     let first_lines = content.lines().take(50).collect::<Vec<_>>().join("\n");
-                    info!("✅ File context loaded via absolute path: {} lines", content.lines().count());
+                    info!("✅ File context loaded via relative path: {} lines", content.lines().count());
                     info!("📄 File preview: {}", &first_lines[..std::cmp::min(200, first_lines.len())]);
                     Some(first_lines)
                 }
                 Err(e2) => {
-                    warn!("❌ Failed to read via absolute path: {}", e2);
+                    warn!("❌ Failed to read via relative path: {}", e2);
                     None
                 }
             }
@@ -996,16 +996,15 @@ async fn run_architecture_analysis() -> Result<()> {
     }
 
     // Commit & push
-    let user_name = env::var("GIT_USER_NAME").unwrap_or_else(|_| "architect-ai-improver".into());
-    let user_email =
-        env::var("GIT_USER_EMAIL").unwrap_or_else(|_| "architect-ai@github.com".into());
+    let user_name = "Vadim Nicolai";
+    let user_email = "nicolai.vadim@gmail.com";
 
     info!(
         "🔧 Setting up Git config - user: {}, email: {}",
         user_name, user_email
     );
-    run(&root, "git", &["config", "user.name", &user_name])?;
-    run(&root, "git", &["config", "user.email", &user_email])?;
+    run(&root, "git", &["config", "user.name", user_name])?;
+    run(&root, "git", &["config", "user.email", user_email])?;
 
     // Determine the current branch; avoid creating a new one.
     let mut branch = run(&root, "git", &["rev-parse", "--abbrev-ref", "HEAD"])?
