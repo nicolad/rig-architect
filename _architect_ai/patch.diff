@@ -1,0 +1,11 @@
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -23,7 +23,7 @@ use anyhow::{anyhow, Context, Result};
+ use apalis::layers::retry::RetryPolicy;
+ use apalis::prelude::*;
+ use apalis_cron::CronStream;
+-use apalis_cron::Schedule;
++use apalis_cron::cron::Schedule;
+ use chrono::{DateTime, Utc};
+ use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+ use regex::Regex;
