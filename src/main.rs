@@ -750,7 +750,7 @@ You are a senior Rust code reviewer. Given a unified diff and post-patch files, 
 }
 
 Heuristics:
-- Prefer clear documentation, proper error handling, good naming conventions.
+- Prefer proper error handling, good naming conventions, and robust code.
 - Code must compile and follow Rust best practices.
 - No unsafe code without justification.
 - Absolutely no secrets/keys/tokens/passwords in code or comments.
