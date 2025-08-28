@@ -2,6 +2,14 @@
 //!
 //! This tool automatically finds, audits, and commits tiny architecture improvements
 //! using AI-powered analysis with ranking and memory systems.
+//!
+//! ## DeepSeek Context Caching Optimization
+//!
+//! The system leverages DeepSeek's automatic context caching to reduce API costs:
+//! - Uses architecture_agent() for the main improver with pre-configured few-shot examples
+//! - Maintains consistent message ordering for maximum cache hits
+//! - Cache pricing: 0.1 yuan vs 1 yuan per million tokens (10x cost reduction)
+//! - Logs cache hit statistics for monitoring efficiency
 
 mod config;
 mod deepseek;
@@ -1146,7 +1154,7 @@ async fn run_architecture_analysis() -> Result<()> {
     };
 
     let mut improver = ds
-        .agent(chat_model)
+        .architecture_agent(chat_model) // Use cache-optimized agent for architectural improvements
         .preamble(&improver_preamble(
             &profile.rank,
             config.max_changed_lines,
@@ -1534,4 +1542,410 @@ async fn run_architecture_analysis() -> Result<()> {
 
     info!("✅ Success! Committed to main branch");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::Deserialize;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_tmp_path(suffix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "ai_arch_tests_{}_{}_{}",
+            std::process::id(),
+            nanos,
+            suffix
+        ));
+        p
+    }
+
+    fn write_temp_file(contents: &str, suffix: &str) -> PathBuf {
+        let p = unique_tmp_path(suffix);
+        fs::write(&p, contents).expect("write temp file");
+        p
+    }
+
+    #[test]
+    fn validate_and_clean_patch_ok_with_duplicate_headers_and_context() {
+        // Create a target file that contains the context lines used below.
+        let target = write_temp_file(
+            r#"fn foo() {
+    println!("old");
+}
+"#,
+            "target.rs",
+        );
+
+        // Patch with duplicated diff headers (the function should clean that up).
+        let patch = r#"--- a/src/main.rs
++++ b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,3 +1,3 @@
+ fn foo() {
+-    println!("old");
++    println!("new");
+ }
+"#;
+
+        let cleaned = validate_and_clean_patch(patch, target.to_str().unwrap())
+            .expect("patch should validate and be cleaned");
+        assert!(
+            cleaned.ends_with('\n'),
+            "cleaned patch must end with newline"
+        );
+        // It must contain exactly one set of headers after cleaning.
+        let minus_headers =
+            cleaned.matches("\n--- a/").count() + cleaned.starts_with("--- a/") as usize;
+        let plus_headers =
+            cleaned.matches("\n+++ b/").count() + cleaned.starts_with("+++ b/") as usize;
+        assert_eq!(minus_headers, 1, "only one --- a/ header");
+        assert_eq!(plus_headers, 1, "only one +++ b/ header");
+        // Hunk header preserved.
+        assert!(cleaned.contains("@@ -1,3 +1,3 @@"));
+    }
+
+    #[test]
+    fn validate_and_clean_patch_err_when_missing_headers() {
+        // Missing --- a/ and +++ b/ headers.
+        let patch = r#"@@ -1,1 +1,1 @@
+-foo
++bar
+"#;
+        let err = validate_and_clean_patch(patch, "does_not_matter.rs").unwrap_err();
+        assert!(
+            err.contains("Patch missing required diff headers"),
+            "expected header error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_and_clean_patch_err_when_missing_hunk() {
+        let patch = r#"--- a/x
++++ b/x
+ some context line
+"#;
+        let err = validate_and_clean_patch(patch, "whatever.rs").unwrap_err();
+        assert!(
+            err.contains("Patch missing hunk headers"),
+            "expected hunk error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn changed_lines_in_patch_counts_only_adds_and_deletes() {
+        let patch = r#"--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,3 +1,3 @@
+ fn foo() {
+-    println!("old");
++    println!("new");
+ }
+"#;
+        let n = changed_lines_in_patch(patch);
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn likely_secret_present_detects_aws_key() {
+        let s = "Access key: AKIAABCDEFGHIJKLMNOP";
+        assert!(likely_secret_present(s));
+    }
+
+    #[test]
+    fn likely_secret_present_detects_github_token() {
+        let s = "token ghp_123456789012345678901234 extra";
+        assert!(likely_secret_present(s));
+    }
+
+    #[test]
+    fn likely_secret_present_detects_generic_api_key() {
+        let s = r#"api_key = "abcdefghijkl""#; // 12 chars
+        assert!(likely_secret_present(s));
+    }
+
+    #[test]
+    fn likely_secret_present_negative_case() {
+        let s = "no secrets here, move along";
+        assert!(!likely_secret_present(s));
+    }
+
+    #[test]
+    fn enc_percent_encodes_selected_chars() {
+        let s = "a b#c?d@e\\f^g{h|i}j\"k%l<m>n";
+        let e = enc(s);
+        // Spot-check the most important pieces.
+        assert!(e.contains("a%20b")); // space -> %20
+        assert!(e.contains("%23c")); // # -> %23
+        assert!(e.contains("%3Fd")); // ? -> %3F
+        assert!(e.contains("%40e")); // @ -> %40
+        assert!(e.contains("%5Cf")); // backslash -> %5C
+        assert!(e.contains("%5Eg")); // ^ -> %5E
+        assert!(e.contains("%7Bh")); // { -> %7B
+        assert!(e.contains("%7Ci")); // | -> %7C
+        assert!(e.contains("%7Dj")); // } -> %7D
+        assert!(e.contains("%22k")); // " -> %22
+        assert!(e.contains("%25l")); // % -> %25
+        assert!(e.contains("%3Cm")); // < -> %3C
+        assert!(e.contains("%3En")); // > -> %3E
+    }
+
+    #[test]
+    fn https_url_from_remote_conversions() {
+        let ssh_like = "git@github.com:owner/repo.git";
+        let https = https_url_from_remote(ssh_like).expect("convert ssh-like to https");
+        assert_eq!(https, "https://github.com/owner/repo.git");
+
+        let already_https = "https://github.com/owner/repo";
+        let same = https_url_from_remote(already_https).expect("keep https");
+        assert_eq!(same, already_https);
+
+        let unsupported = "ssh://git@github.com/owner/repo.git";
+        assert!(https_url_from_remote(unsupported).is_none());
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct Tiny {
+        a: i32,
+    }
+
+    #[test]
+    fn parse_ai_response_json_parses_plain_json() {
+        let j = r#"{ "a": 1 }"#;
+        let v: Tiny = parse_ai_response_json(j).expect("parse plain json");
+        assert_eq!(v, Tiny { a: 1 });
+    }
+
+    #[test]
+    fn parse_ai_response_json_extracts_embedded_json() {
+        let j = r#"Here you go:
+some prose...
+{ "a": 42 }
+and more prose"#;
+        let v: Tiny = parse_ai_response_json(j).expect("extract embedded json");
+        assert_eq!(v, Tiny { a: 42 });
+    }
+
+    #[test]
+    fn parse_ai_response_json_errors_on_bad_payload() {
+        let j = "this is not json at all";
+        let err = parse_ai_response_json::<Tiny>(j).unwrap_err();
+        assert!(
+            err.to_string().contains("Could not parse JSON"),
+            "expected a parse error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn sanitize_for_log_redacts_long_tokens() {
+        let s = "push https://ABCDEFGHIJKLMNOPQRSTU@github.com/owner/repo.git";
+        let redacted = sanitize_for_log(s);
+        assert!(
+            redacted.contains("***REDACTED***"),
+            "should redact long userinfo: {redacted}"
+        );
+        // Short userinfo should remain.
+        let s2 = "push https://short@github.com/owner/repo.git";
+        let redacted2 = sanitize_for_log(s2);
+        assert_eq!(s2, redacted2);
+    }
+
+    // Additional comprehensive tests
+
+    #[test]
+    fn test_validate_and_clean_patch_context_mismatch_is_error() {
+        let target_contents = "foo\nbar\nbaz\n";
+        let target_path = write_temp_file(target_contents, "context_test.rs");
+        let target_str = target_path.to_string_lossy().to_string();
+
+        // Context lines (' qux ') not present in target file -> should fail
+        let mismatched_patch = "\
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,3 +1,3 @@
+ qux
+-quux
++quuz
+ corge
+";
+
+        let err = validate_and_clean_patch(mismatched_patch, &target_str).unwrap_err();
+        assert!(
+            err.to_lowercase().contains("context"),
+            "expected context mismatch error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_rank_slug_and_promotions() {
+        // Test rank slugs
+        assert_eq!(rank_slug(&Rank::Junior), "jr");
+        assert_eq!(rank_slug(&Rank::Mid), "mid");
+        assert_eq!(rank_slug(&Rank::Senior), "sr");
+
+        // Junior -> Mid promotion
+        let mut p = Profile::default();
+        p.success_streak = 3;
+        p.rolling_avg = 0.90;
+        let (promoted, new_rank) = maybe_promote(&p);
+        assert!(promoted);
+        assert_eq!(new_rank, Rank::Mid);
+
+        // Mid -> Senior promotion
+        let p2 = Profile {
+            rank: Rank::Mid,
+            success_streak: 5,
+            total_success: 0,
+            total_runs: 0,
+            rolling_avg: 0.94,
+            last_promo_ts: Utc::now().to_rfc3339(),
+        };
+        let (promoted2, new_rank2) = maybe_promote(&p2);
+        assert!(promoted2);
+        assert_eq!(new_rank2, Rank::Senior);
+
+        // No promotion when thresholds not met
+        let mut p3 = Profile::default();
+        p3.success_streak = 2; // below threshold
+        p3.rolling_avg = 0.95;
+        let (promoted3, new_rank3) = maybe_promote(&p3);
+        assert!(!promoted3);
+        assert_eq!(new_rank3, Rank::Junior);
+    }
+
+    #[test]
+    fn test_likely_secret_present_jwt_detection() {
+        let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0IiwibmFtZSI6IkpvaG4ifQ.dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        assert!(likely_secret_present(jwt));
+
+        // Test a realistic JWT-like pattern that matches our regex
+        let partial_jwt = "eyJSomeHeader123.eyJPayloadData456.SignaturePartAbc";
+        assert!(likely_secret_present(partial_jwt));
+    }
+    #[test]
+    fn test_likely_secret_present_various_github_tokens() {
+        assert!(likely_secret_present("ghp_abcdefghijklmnopqrstuvwxyz1234"));
+        assert!(likely_secret_present("ghs_abcdefghijklmnopqrstuvwxyz1234"));
+        assert!(likely_secret_present("gho_abcdefghijklmnopqrstuvwxyz1234"));
+        assert!(likely_secret_present("ghu_abcdefghijklmnopqrstuvwxyz1234"));
+        assert!(likely_secret_present("ghr_abcdefghijklmnopqrstuvwxyz1234"));
+    }
+
+    #[test]
+    fn test_enc_specific_userinfo_chars() {
+        // Test specific characters that should be encoded in userinfo
+        assert_eq!(enc("abc@def"), "abc%40def");
+        assert_eq!(enc("abc?def"), "abc%3Fdef");
+        assert_eq!(enc("abc def"), "abc%20def");
+        assert_eq!(enc("abc#def"), "abc%23def");
+        assert_eq!(enc("abc%def"), "abc%25def");
+    }
+
+    #[test]
+    fn test_parse_ai_response_json_with_code_fences() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct TestStruct {
+            title: String,
+            value: i32,
+        }
+
+        // JSON in code fences
+        let fenced = "```json\n{\"title\":\"test\", \"value\":42}\n```";
+        let result: TestStruct = parse_ai_response_json(fenced).expect("should parse fenced json");
+        assert_eq!(
+            result,
+            TestStruct {
+                title: "test".to_string(),
+                value: 42
+            }
+        );
+
+        // JSON embedded in prose
+        let embedded = "Here's the result: {\"title\":\"embedded\", \"value\":123} end of text";
+        let result2: TestStruct =
+            parse_ai_response_json(embedded).expect("should parse embedded json");
+        assert_eq!(
+            result2,
+            TestStruct {
+                title: "embedded".to_string(),
+                value: 123
+            }
+        );
+    }
+
+    #[test]
+    fn test_changed_lines_comprehensive() {
+        let complex_patch = "\
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -10,8 +10,10 @@
+ context line 1
+ context line 2
+-removed line 1
+-removed line 2
++added line 1
++added line 2
++added line 3
+ context line 3
+ context line 4
++final added line
+";
+        // Should count: 2 deletions + 4 additions = 6 total changed lines
+        assert_eq!(changed_lines_in_patch(complex_patch), 6);
+    }
+
+    #[test]
+    fn test_profile_default_values() {
+        let profile = Profile::default();
+        assert_eq!(profile.rank, Rank::Junior);
+        assert_eq!(profile.success_streak, 0);
+        assert_eq!(profile.total_success, 0);
+        assert_eq!(profile.total_runs, 0);
+        assert_eq!(profile.rolling_avg, 0.0);
+        // last_promo_ts should be a valid RFC3339 timestamp
+        assert!(chrono::DateTime::parse_from_rfc3339(&profile.last_promo_ts).is_ok());
+    }
+
+    #[test]
+    fn test_memory_and_execution_paths() {
+        // Test memory directory path
+        assert_eq!(memory_dir(), "./_architect_ai");
+        assert_eq!(memory_file(), "./_architect_ai/memory.jsonl");
+        assert_eq!(profile_file(), "./_architect_ai/profile.json");
+        assert_eq!(patch_path(), "./_architect_ai/patch.diff");
+        assert_eq!(execution_log_file(), "./_architect_ai/execution.log");
+    }
+
+    #[test]
+    fn test_https_url_edge_cases() {
+        // Already HTTPS URL should be preserved
+        let https_url = "https://github.com/user/repo.git";
+        assert_eq!(
+            https_url_from_remote(https_url),
+            Some(https_url.to_string())
+        );
+
+        // HTTPS without .git extension
+        let https_no_git = "https://github.com/user/repo";
+        assert_eq!(
+            https_url_from_remote(https_no_git),
+            Some(https_no_git.to_string())
+        );
+
+        // Non-GitHub SSH should return None
+        let gitlab_ssh = "git@gitlab.com:user/repo.git";
+        assert_eq!(https_url_from_remote(gitlab_ssh), None);
+
+        // Invalid format should return None
+        let invalid = "not-a-valid-git-url";
+        assert_eq!(https_url_from_remote(invalid), None);
+    }
 }

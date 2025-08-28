@@ -7,6 +7,15 @@ authors = ["Vadim Nicolai <nicolai.vadim@gmail.com>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/nicolad/rig-architect"
 
+# Binary targets
+[[bin]]
+name = "ai_architect"
+path = "src/main.rs"
+
+[[bin]]
+name = "generate_types"
+path = "bin/generate_types.rs"
+
 [dependencies]
 # Core async runtime and utilities
 anyhow = "1"
