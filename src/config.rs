@@ -14,6 +14,7 @@ pub struct Config {
 
 impl Config {
     /// Load configuration from environment variables
+    /// Returns a Config instance with values parsed from environment variables or defaults
     pub fn from_env() -> Self {
         Self {
             max_changed_lines: env::var("ARCH_MAX_LINES")
