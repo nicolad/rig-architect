@@ -624,7 +624,7 @@ fn improver_preamble(
     target_file_contents: Option<&str>,
 ) -> String {
     let scope = match rank {
-        Rank::Junior => "Aim for small code improvements: add missing docs, fix typos, add error handling, simple refactors.",
+        Rank::Junior => "Aim for small functional improvements: fix bugs, add error handling, optimize performance, improve logic.",
         Rank::Mid => "You may refactor functions, improve error messages, add helper functions, reorganize imports.",
         Rank::Senior => "You may create new modules, add advanced features, improve architecture within the line budget.",
     };
@@ -681,14 +681,17 @@ Available files:
 Scope guidance: {scope}
 
 Examples of good improvements:
-- Add missing documentation comments
-- Improve error messages 
+- Fix bugs and edge cases
+- Improve error handling and recovery
 - Add helper functions to reduce duplication
 - Create new utility modules (src/utils.rs, src/git.rs, etc.)
 - Add better logging or debug output
 - Improve function signatures or return types
 - Add configuration options
-- Small performance improvements
+- Small performance optimizations
+- Enhance safety and reliability
+
+AVOID: Documentation comments, code formatting, non-functional changes
 
 Guardrails:
 - No breaking changes to public APIs
