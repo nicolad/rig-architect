@@ -6,8 +6,7 @@
 mod config;
 
 use std::{
-    env,
-    fs,
+    env, fs,
     path::{Path, PathBuf},
     process::Command,
     str::FromStr,
@@ -28,11 +27,208 @@ use walkdir::WalkDir;
 use rig::{
     client::CompletionClient,
     completion::Prompt,
-    providers::deepseek,
+    providers::deepseek::{self, DEEPSEEK_REASONER},
     vector_store::in_memory_store::InMemoryVectorStore,
 };
 
 use config::Config;
+
+// ============================================================================
+// AI Tools for Code Analysis (for future enhancement)
+// ============================================================================
+
+#[allow(dead_code)]
+struct ReadFileContentTool;
+
+#[allow(dead_code)]
+impl ReadFileContentTool {
+    async fn read_file(&self, file_path: String) -> Result<String, String> {
+        // Security check - only allow reading source files
+        if !file_path.ends_with(".rs")
+            && !file_path.ends_with(".toml")
+            && !file_path.ends_with(".md")
+        {
+            return Err("Only .rs, .toml, and .md files are allowed".to_string());
+        }
+
+        if file_path.contains("..") || file_path.starts_with('/') {
+            return Err("Path traversal not allowed".to_string());
+        }
+
+        match std::fs::read_to_string(&file_path) {
+            Ok(content) => Ok(content),
+            Err(e) => Err(format!("Failed to read file {}: {}", file_path, e)),
+        }
+    }
+}
+
+#[allow(dead_code)]
+struct SearchCodeTool;
+
+#[allow(dead_code)]
+impl SearchCodeTool {
+    async fn search_pattern(
+        &self,
+        pattern: String,
+        file_extensions: Option<String>,
+    ) -> Result<String, String> {
+        let extensions = file_extensions.unwrap_or_else(|| "rs,toml".to_string());
+        let ext_list: Vec<&str> = extensions.split(',').collect();
+
+        let mut results = Vec::new();
+        let regex = match Regex::new(&pattern) {
+            Ok(r) => r,
+            Err(e) => return Err(format!("Invalid regex pattern: {}", e)),
+        };
+
+        for entry in WalkDir::new(".") {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let path = entry.path();
+
+            if let Some(ext) = path.extension() {
+                if ext_list.iter().any(|&e| e == ext.to_string_lossy()) {
+                    if let Ok(content) = std::fs::read_to_string(path) {
+                        for (line_num, line) in content.lines().enumerate() {
+                            if regex.is_match(line) {
+                                results.push(format!(
+                                    "{}:{}: {}",
+                                    path.display(),
+                                    line_num + 1,
+                                    line.trim()
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if results.is_empty() {
+            Ok("No matches found".to_string())
+        } else {
+            Ok(results.join("\n"))
+        }
+    }
+}
+
+#[allow(dead_code)]
+struct CodeValidationTool;
+
+#[allow(dead_code)]
+impl CodeValidationTool {
+    async fn check_code(&self, check_type: String) -> Result<String, String> {
+        let output = match check_type.as_str() {
+            "check" => std::process::Command::new("cargo")
+                .arg("check")
+                .output()
+                .map_err(|e| e.to_string())?,
+            "clippy" => std::process::Command::new("cargo")
+                .arg("clippy")
+                .arg("--")
+                .arg("-W")
+                .arg("clippy::all")
+                .output()
+                .map_err(|e| e.to_string())?,
+            "test" => std::process::Command::new("cargo")
+                .arg("test")
+                .arg("--no-run")
+                .output()
+                .map_err(|e| e.to_string())?,
+            _ => return Err("Invalid check type. Use 'check', 'clippy', or 'test'".to_string()),
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        Ok(format!(
+            "Exit code: {}\nStdout:\n{}\nStderr:\n{}",
+            output.status.code().unwrap_or(-1),
+            stdout,
+            stderr
+        ))
+    }
+}
+
+#[allow(dead_code)]
+struct CodeAnalysisTool;
+
+#[allow(dead_code)]
+impl CodeAnalysisTool {
+    async fn analyze_function(
+        &self,
+        file_path: String,
+        function_name: String,
+    ) -> Result<String, String> {
+        let content = std::fs::read_to_string(&file_path)
+            .map_err(|e| format!("Failed to read file: {}", e))?;
+
+        // Simple function analysis
+        let lines: Vec<&str> = content.lines().collect();
+        let mut in_function = false;
+        let mut function_lines = Vec::new();
+        let mut brace_count = 0;
+
+        for (i, line) in lines.iter().enumerate() {
+            if line.contains(&format!("fn {}", function_name)) {
+                in_function = true;
+                function_lines.push((i + 1, line.trim()));
+            } else if in_function {
+                function_lines.push((i + 1, line.trim()));
+                brace_count += line.chars().filter(|&c| c == '{').count() as i32;
+                brace_count -= line.chars().filter(|&c| c == '}').count() as i32;
+
+                if brace_count <= 0 && line.contains('}') {
+                    break;
+                }
+            }
+        }
+
+        if function_lines.is_empty() {
+            return Err(format!(
+                "Function '{}' not found in {}",
+                function_name, file_path
+            ));
+        }
+
+        let complexity = function_lines.len();
+        let analysis =
+            format!(
+            "Function '{}' analysis:\n- Lines: {}\n- Complexity: {}\n- Suggestion: {}\n\nCode:\n{}",
+            function_name,
+            complexity,
+            if complexity > 50 { "High" } else if complexity > 20 { "Medium" } else { "Low" },
+            if complexity > 50 { "Consider breaking into smaller functions" } 
+            else if complexity > 20 { "Could benefit from some refactoring" }
+            else { "Complexity is reasonable" },
+            function_lines.iter()
+                .map(|(num, line)| format!("{:3}: {}", num, line))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+
+        Ok(analysis)
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn parse_ai_response_json<T: for<'a> Deserialize<'a>>(response: &str) -> Result<T, anyhow::Error> {
+    let cleaned = response
+        .trim()
+        .trim_start_matches("```json")
+        .trim_end_matches("```")
+        .trim();
+    serde_json::from_str(cleaned)
+        .or_else(|_| {
+            // Try to extract JSON from response if it's embedded in text
+            let json_start = cleaned.find('{').unwrap_or(0);
+            let json_end = cleaned.rfind('}').map(|i| i + 1).unwrap_or(cleaned.len());
+            serde_json::from_str(&cleaned[json_start..json_end])
+        })
+        .context("Could not parse JSON from AI response")
+}
 
 // ============================================================================
 // Cron Job Data Structure
@@ -49,7 +245,7 @@ impl ArchitectService {
             message: "AI Architecture Improver".to_string(),
         }
     }
-    
+
     async fn execute(&self, _item: ArchitectReminder) -> Result<()> {
         info!("{} - Starting architecture analysis", &self.message);
         run_architecture_analysis().await
@@ -169,7 +365,11 @@ fn save_profile(p: &Profile) -> Result<()> {
 
 fn load_memory() -> Vec<MemoryItem> {
     fs::read_to_string(memory_file())
-        .map(|s| s.lines().filter_map(|l| serde_json::from_str(l).ok()).collect())
+        .map(|s| {
+            s.lines()
+                .filter_map(|l| serde_json::from_str(l).ok())
+                .collect()
+        })
         .unwrap_or_else(|_| vec![])
 }
 
@@ -201,12 +401,11 @@ async fn build_memory_index(
 fn likely_secret_present(s: &str) -> bool {
     let aws = Regex::new(r"AKIA[0-9A-Z]{16}").unwrap();
     let gh = Regex::new(r"gh[pousr]_[A-Za-z0-9]{24,}").unwrap();
-    let jwt = Regex::new(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9._-]{10,}\.[A-Za-z0-9._-]{10,}")
-        .unwrap();
-    let generic = Regex::new(
-        r#"(?i)(secret|api[_-]?key|token|password)\s*[:=]\s*['"][^'"\n]{12,}['"]"#,
-    )
-    .unwrap();
+    let jwt =
+        Regex::new(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9._-]{10,}\.[A-Za-z0-9._-]{10,}").unwrap();
+    let generic =
+        Regex::new(r#"(?i)(secret|api[_-]?key|token|password)\s*[:=]\s*['"][^'"\n]{12,}['"]"#)
+            .unwrap();
     aws.is_match(s) || gh.is_match(s) || jwt.is_match(s) || generic.is_match(s)
 }
 
@@ -237,7 +436,9 @@ fn https_url_from_remote(remote: &str) -> Option<String> {
     if remote.starts_with("https://") {
         Some(remote.to_string())
     } else {
-        remote.strip_prefix("git@github.com:").map(|tail| format!("https://github.com/{tail}"))
+        remote
+            .strip_prefix("git@github.com:")
+            .map(|tail| format!("https://github.com/{tail}"))
     }
 }
 
@@ -297,17 +498,24 @@ fn list_arch_files() -> Result<String> {
             .unwrap_or(p)
             .to_string_lossy()
             .to_string();
-        // Focus on code files for self-improvement
+        // Focus on code and tests, ignore documentation
         let is_code = rel.ends_with(".rs")
-            || rel == "Cargo.toml" 
-            || rel == "README.md"
+            || rel == "Cargo.toml"
             || rel.starts_with("src/")
-            || rel.ends_with(".toml")
-            || rel.ends_with(".md");
+            || rel.starts_with("tests/")
+            || rel.ends_with(".toml");
+        let is_documentation = rel.ends_with(".md")
+            || rel.starts_with("docs/")
+            || rel.starts_with("doc/")
+            || rel.contains("/README")
+            || rel.contains("/CHANGELOG")
+            || rel.contains("/LICENSE");
         let ignore = rel.contains("/.git/")
             || rel.contains("/target/")
+            || rel.starts_with("target/")
             || rel.contains("/node_modules/")
-            || rel.contains("/.cargo/");
+            || rel.contains("/.cargo/")
+            || is_documentation;
         if is_code && !ignore {
             out.push(rel);
         }
@@ -319,7 +527,13 @@ fn list_arch_files() -> Result<String> {
 // AI Prompts
 // ============================================================================
 
-fn improver_preamble(rank: &Rank, max_lines: usize, include: &str, exclude: &str, files: &str) -> String {
+fn improver_preamble(
+    rank: &Rank,
+    max_lines: usize,
+    include: &str,
+    exclude: &str,
+    files: &str,
+) -> String {
     let scope = match rank {
         Rank::Junior => "Aim for small code improvements: add missing docs, fix typos, add error handling, simple refactors.",
         Rank::Mid => "You may refactor functions, improve error messages, add helper functions, reorganize imports.",
@@ -327,13 +541,29 @@ fn improver_preamble(rank: &Rank, max_lines: usize, include: &str, exclude: &str
     };
     format!(
         r#"
-You are an AI Architect at **{rank}** level. Find EXACTLY ONE tiny improvement to this Rust codebase
-with the smallest blast radius. Keep changes within **{max_lines} lines** total.
+You are an AI Architect at **{rank}** level with access to powerful code analysis tools. 
+
+AVAILABLE TOOLS:
+- read_file: Read specific source files to examine their contents
+- search_pattern: Search for code patterns using regex
+- check_code: Run cargo check, clippy, or test validation  
+- analyze_function: Analyze function complexity and get suggestions
+
+USE THESE TOOLS to thoroughly analyze the codebase before proposing changes.
+
+Find EXACTLY ONE tiny improvement to this Rust codebase with the smallest blast radius. 
+Keep changes within **{max_lines} lines** total.
 
 Available files:
 {files}
 
 Scope guidance: {scope}
+
+PROCESS:
+1. First, use tools to explore and understand the codebase
+2. Identify specific improvement opportunities  
+3. Validate your approach using the available tools
+4. Propose a single, focused improvement
 
 Examples of good improvements:
 - Add missing documentation comments
@@ -366,12 +596,20 @@ Make sure file paths in the diff are relative to the repo root.
 "#,
         rank = match rank {
             Rank::Junior => "junior",
-            Rank::Mid => "mid", 
+            Rank::Mid => "mid",
             Rank::Senior => "senior",
         },
         max_lines = max_lines,
-        include = if include.is_empty() { "(none)" } else { include },
-        exclude = if exclude.is_empty() { "(none)" } else { exclude },
+        include = if include.is_empty() {
+            "(none)"
+        } else {
+            include
+        },
+        exclude = if exclude.is_empty() {
+            "(none)"
+        } else {
+            exclude
+        },
         files = files
     )
 }
@@ -455,9 +693,9 @@ async fn architect_cron_job(job: ArchitectReminder, svc: Data<ArchitectService>)
 #[shuttle_runtime::main]
 async fn main() -> Result<MyService, shuttle_runtime::Error> {
     dotenvy::dotenv().ok();
-    
+
     info!("🚀 Initializing AI Architecture Improver Cron Service");
-    
+
     Ok(MyService {})
 }
 
@@ -472,9 +710,10 @@ impl shuttle_runtime::Service for MyService {
 
         // Load configuration
         let config = Config::from_env();
-        
+
         // Validate the cron schedule
-        config.validate_cron_schedule()
+        config
+            .validate_cron_schedule()
             .map_err(|e| shuttle_runtime::Error::Custom(anyhow::Error::msg(e)))?;
 
         info!("📅 Using cron schedule: {}", config.cron_schedule);
@@ -493,8 +732,11 @@ impl shuttle_runtime::Service for MyService {
             .backend(cron_stream)
             .build_fn(architect_cron_job);
 
-        info!("🕒 Starting cron worker with schedule: {}", config.cron_schedule);
-        
+        info!(
+            "🕒 Starting cron worker with schedule: {}",
+            config.cron_schedule
+        );
+
         // Start the worker
         worker.run().await;
 
@@ -508,7 +750,7 @@ impl shuttle_runtime::Service for MyService {
 
 async fn run_architecture_analysis() -> Result<()> {
     dotenvy::dotenv().ok();
-    
+
     let config = Config::from_env();
 
     info!("🚀 Starting AI Architecture Improver");
@@ -518,11 +760,10 @@ async fn run_architecture_analysis() -> Result<()> {
     );
 
     // Provider
-    let api_key = env::var("DEEPSEEK_API_KEY")
-        .context("DEEPSEEK_API_KEY environment variable not set")?;
+    let api_key =
+        env::var("DEEPSEEK_API_KEY").context("DEEPSEEK_API_KEY environment variable not set")?;
     let ds = deepseek::Client::new(&api_key);
-    let chat_model =
-        env::var("DEEPSEEK_CHAT_MODEL").unwrap_or_else(|_| "deepseek-chat".to_string());
+    let chat_model = DEEPSEEK_REASONER;
 
     // Repo setup
     let root = repo_root()?;
@@ -542,12 +783,12 @@ async fn run_architecture_analysis() -> Result<()> {
     // Build Improver agent (simple approach)
     let include = config.include.clone().unwrap_or_default();
     let exclude = config.exclude.clone().unwrap_or_default();
-    
+
     // Get available files
     let files = list_arch_files().unwrap_or_else(|_| "[]".to_string());
 
     let improver = ds
-        .agent(&chat_model)
+        .agent(chat_model)
         .preamble(&improver_preamble(
             &profile.rank,
             config.max_changed_lines,
@@ -562,17 +803,10 @@ async fn run_architecture_analysis() -> Result<()> {
         .prompt("Propose one tiny improvement now. Follow the protocol strictly.")
         .await?;
     debug!("Improver said: {}", resp);
-    
+
     // Parse JSON response directly
-    let raw = resp.trim().trim_start_matches("```json").trim_end_matches("```").trim();
-    let proposal: ProposedChange = serde_json::from_str(raw)
-        .or_else(|_| {
-            // Try to extract JSON from response
-            let json_start = raw.find('{').unwrap_or(0);
-            let json_end = raw.rfind('}').map(|i| i + 1).unwrap_or(raw.len());
-            serde_json::from_str(&raw[json_start..json_end])
-        })
-        .context("Could not parse proposal JSON from response")?;
+    let proposal: ProposedChange =
+        parse_ai_response_json(&resp).context("Could not parse proposal JSON from response")?;
 
     info!("📝 Proposal: {}", proposal.title);
 
@@ -593,16 +827,24 @@ async fn run_architecture_analysis() -> Result<()> {
     }
 
     // Check apply
-    fs::write(patch_path(), &proposal.patch)?;
-    
+    let mut patch_content = proposal.patch.clone();
+    // Ensure the patch ends with a newline to avoid corruption
+    if !patch_content.ends_with('\n') {
+        patch_content.push('\n');
+    }
+    fs::write(patch_path(), &patch_content)?;
+
     // Debug: show the patch content
     debug!("Generated patch:\n{}", proposal.patch);
-    
+
     // Try to apply the patch and provide better error info
     match run(&root, "git", &["apply", "--check", patch_path()]) {
         Ok(_) => info!("✅ Patch applies cleanly"),
         Err(e) => {
             warn!("❌ Patch failed to apply: {}", e);
+            // Show patch content for debugging
+            debug!("Patch content length: {} bytes", patch_content.len());
+            debug!("Patch content:\n{}", patch_content);
             // Show git status for debugging
             if let Ok(status) = run(&root, "git", &["status", "--porcelain"]) {
                 debug!("Git status:\n{}", status);
@@ -629,23 +871,20 @@ async fn run_architecture_analysis() -> Result<()> {
     }
 
     // Auditor - simple approach
-    let auditor = ds.agent(&chat_model).preamble(&auditor_preamble()).build();
+    let auditor = ds.agent(chat_model).preamble(&auditor_preamble()).build();
 
     let audit_input = format!(
         "PATCH:\n{}\n\nFILES AFTER PATCH:\n{}\n",
         proposal.patch, auditor_files
     );
-    let audit_resp = auditor.prompt(&audit_input).await.context("auditor failed")?;
-    
+    let audit_resp = auditor
+        .prompt(&audit_input)
+        .await
+        .context("auditor failed")?;
+
     // Parse audit response
-    let audit_json = audit_resp.trim().trim_start_matches("```json").trim_end_matches("```").trim();
-    let verdict: AuditVerdict = serde_json::from_str(audit_json)
-        .or_else(|_| {
-            let json_start = audit_json.find('{').unwrap_or(0);
-            let json_end = audit_json.rfind('}').map(|i| i + 1).unwrap_or(audit_json.len());
-            serde_json::from_str(&audit_json[json_start..json_end])
-        })
-        .unwrap_or_else(|_| AuditVerdict {
+    let verdict: AuditVerdict =
+        parse_ai_response_json(&audit_resp).unwrap_or_else(|_| AuditVerdict {
             ok: false,
             best_practice_score: 0.5,
             security_ok: false,
@@ -653,7 +892,7 @@ async fn run_architecture_analysis() -> Result<()> {
             vuln_risk: true,
             comments: vec!["Failed to parse audit response".to_string()],
         });
-        
+
     let local_secret_flag =
         likely_secret_present(&auditor_files) || likely_secret_present(&proposal.patch);
     let avg_score = verdict.best_practice_score;
@@ -684,47 +923,86 @@ async fn run_architecture_analysis() -> Result<()> {
 
     // Commit & push
     let user_name = env::var("GIT_USER_NAME").unwrap_or_else(|_| "architect-ai-improver".into());
-    let user_email = env::var("GIT_USER_EMAIL").unwrap_or_else(|_| "architect-ai@github.com".into());
-    
-    info!("🔧 Setting up Git config - user: {}, email: {}", user_name, user_email);
+    let user_email =
+        env::var("GIT_USER_EMAIL").unwrap_or_else(|_| "architect-ai@github.com".into());
+
+    info!(
+        "🔧 Setting up Git config - user: {}, email: {}",
+        user_name, user_email
+    );
     run(&root, "git", &["config", "user.name", &user_name])?;
     run(&root, "git", &["config", "user.email", &user_email])?;
 
-    let ts = Utc::now()
-        .format("%Y%m%d_%H%M%S")
-        .to_string()
-        .replace(':', "");
-    let branch = format!(
-        "{}/{}-{}",
-        config.branch_prefix.trim_end_matches('/'),
-        rank_slug(&profile.rank),
-        ts
-    );
-    
-    info!("🌿 Creating branch: {}", branch);
-    run(&root, "git", &["checkout", "-b", &branch])?;
+    // Determine the current branch; avoid creating a new one.
+    let mut branch = run(&root, "git", &["rev-parse", "--abbrev-ref", "HEAD"])?
+        .trim()
+        .to_string();
+
+    if branch == "HEAD" {
+        // Detached HEAD → create a branch so we can push somewhere meaningful.
+        let ts = Utc::now()
+            .format("%Y%m%d_%H%M%S")
+            .to_string()
+            .replace(':', "");
+        branch = format!(
+            "{}/{}-{}",
+            config.branch_prefix.trim_end_matches('/'),
+            rank_slug(&profile.rank),
+            ts
+        );
+        info!("🌿 Detached HEAD detected; creating branch: {}", &branch);
+        run(&root, "git", &["checkout", "-b", &branch])?;
+    } else {
+        info!("🌿 Using current branch: {}", &branch);
+    }
 
     let commit_msg = format!(
         "arch: {} [rank={:?} lines={} score={:.2}]\n\n{}\n\n[audited]\n",
         proposal.title, profile.rank, changed, avg_score, proposal.rationale
     );
-    
+
     info!("💾 Committing changes");
     run(&root, "git", &["commit", "-m", &commit_msg])?;
 
     info!("🔑 Setting up authenticated push");
     let token = env::var("GITHUB_TOKEN").map_err(|_| anyhow!("GITHUB_TOKEN not set"))?;
     let remote = origin_url(&root)?;
-    let https =
-        https_url_from_remote(&remote).ok_or_else(|| anyhow!("Unsupported origin URL: {remote}"))?;
+    let https = https_url_from_remote(&remote)
+        .ok_or_else(|| anyhow!("Unsupported origin URL: {remote}"))?;
     let push_url = https.replacen("https://", &format!("https://{}@", enc(&token)), 1);
-    
-    info!("⬆️ Pushing to {}", sanitize_for_log(&push_url));
-    run(&root, "git", &["push", "--set-upstream", &push_url, &branch])
+
+    // Decide whether we need to set upstream or just push.
+    let upstream_exists = run(
+        &root,
+        "git",
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    )
+    .is_ok();
+
+    if upstream_exists {
+        info!(
+            "⬆️ Pushing to {} (branch: {})",
+            sanitize_for_log(&push_url),
+            &branch
+        );
+        run(&root, "git", &["push", &push_url, &branch])
+            .context("Failed to push to GitHub - check your GITHUB_TOKEN permissions")?;
+    } else {
+        info!(
+            "⬆️ Pushing (and setting upstream) to {} (branch: {})",
+            sanitize_for_log(&push_url),
+            &branch
+        );
+        run(
+            &root,
+            "git",
+            &["push", "--set-upstream", &push_url, &branch],
+        )
         .context("Failed to push to GitHub - check your GITHUB_TOKEN permissions")?;
+    }
 
     // Mentor feedback (one-liner) → append to memory
-    let mentor = ds.agent(&chat_model).preamble(&mentor_preamble()).build();
+    let mentor = ds.agent(chat_model).preamble(&mentor_preamble()).build();
     let mentor_note = mentor
         .prompt(&format!(
             "Rank: {:?}\nTitle: {}\nRationale: {}\nAudit score: {:.2}\n",
