@@ -1,8 +1,8 @@
 --- a/src/main.rs
 +++ b/src/main.rs
-@@ -67,7 +67,6 @@ struct ReadFileContentTool;
- 
- #[allow(dead_code)]
- impl ReadFileContentTool {
--    #[allow(dead_code)]
-     async fn read_file(&self, file_path: String) -> Result<String, String> {
+@@ -10,7 +10,6 @@ use std::{
+     path::{Path, PathBuf},
+     process::Command,
+     str::FromStr,
+-    str::FromStr,
+ };
