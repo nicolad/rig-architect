@@ -25,10 +25,6 @@ tower-http = { version = "0.6", features = ["cors", "fs"] }
 apalis = { version = "0.6", features = ["retry"] }
 apalis-cron = "0.6"
 
-# AI and language model integration
-rig = { package = "rig-core", version = "0.18.2", features = ["rmcp"] }
-rig-derive = "0.1.5"
-
 # MCP integration (official Rust SDK)
 rmcp = { version = "0.6", features = ["transport-child-process", "client"] }
 schemars = "0.8"
@@ -39,7 +35,7 @@ walkdir = "2"
 regex = "1"
 percent-encoding = "2"
 
-# GitHub integration
+# GitHub integration and HTTP client for API calls
 reqwest = { version = "0.12", features = ["json"] }
 base64 = "0.22"
 

@@ -1,6 +1,6 @@
 --- a/src/main.rs
 +++ b/src/main.rs
-@@ -10,7 +10,6 @@ use std::{
+@@ -8,7 +8,6 @@ use std::{
      io::Write,
      path::{Path, PathBuf},
      process::Command,

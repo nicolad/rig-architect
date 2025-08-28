@@ -4,6 +4,7 @@
 //! using AI-powered analysis with ranking and memory systems.
 
 mod config;
+mod deepseek;
 
 use std::{
     env, fs,
@@ -24,13 +25,6 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
-
-use rig::{
-    client::CompletionClient,
-    completion::Prompt,
-    providers::deepseek::{self, DEEPSEEK_REASONER},
-    vector_store::in_memory_store::InMemoryVectorStore,
-};
 
 use config::Config;
 
@@ -446,11 +440,11 @@ fn append_memory(item: &MemoryItem) -> Result<()> {
 async fn build_memory_index(
     _ds: &deepseek::Client,
     _items: &[MemoryItem],
-) -> Result<InMemoryVectorStore<String>> {
-    // For now, just return empty store since embedding model is not available in this version
-    let store = InMemoryVectorStore::default();
+) -> Result<()> {
+    // For now, just log that memory index is initialized
+    // In the future, we could implement a simple in-memory search
     info!("Memory index initialized (basic mode)");
-    Ok(store)
+    Ok(())
 }
 
 // ============================================================================
@@ -1015,7 +1009,7 @@ async fn run_architecture_analysis() -> Result<()> {
     let api_key =
         env::var("DEEPSEEK_API_KEY").context("DEEPSEEK_API_KEY environment variable not set")?;
     let ds = deepseek::Client::new(&api_key);
-    let chat_model = DEEPSEEK_REASONER;
+    let chat_model = deepseek::models::DEEPSEEK_REASONER;
 
     // Repo setup
     let root = repo_root()?;
@@ -1025,7 +1019,7 @@ async fn run_architecture_analysis() -> Result<()> {
     // Profile + memory + index
     let mut profile = load_profile();
     let memory = load_memory();
-    let _store = build_memory_index(&ds, &memory).await?;
+    build_memory_index(&ds, &memory).await?;
 
     // Log analysis start
     log_execution_trace(&ExecutionTrace {
@@ -1099,7 +1093,7 @@ async fn run_architecture_analysis() -> Result<()> {
         }
     };
 
-    let improver = ds
+    let mut improver = ds
         .agent(chat_model)
         .preamble(&improver_preamble(
             &profile.rank,
@@ -1271,7 +1265,7 @@ async fn run_architecture_analysis() -> Result<()> {
     }
 
     // Auditor - simple approach
-    let auditor = ds.agent(chat_model).preamble(&auditor_preamble()).build();
+    let mut auditor = ds.agent(chat_model).preamble(&auditor_preamble()).build();
 
     let audit_input = format!(
         "PATCH:\n{}\n\nFILES AFTER PATCH:\n{}\n",
@@ -1429,7 +1423,7 @@ async fn run_architecture_analysis() -> Result<()> {
     }
 
     // Mentor feedback (one-liner) → append to memory
-    let mentor = ds.agent(chat_model).preamble(&mentor_preamble()).build();
+    let mut mentor = ds.agent(chat_model).preamble(&mentor_preamble()).build();
     let mentor_note = mentor
         .prompt(&format!(
             "Rank: {:?}\nTitle: {}\nRationale: {}\nAudit score: {:.2}\n",
