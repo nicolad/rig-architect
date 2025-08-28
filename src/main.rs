@@ -10,6 +10,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     str::FromStr,
+    io::Write,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -396,6 +397,81 @@ async fn build_memory_index(
     let store = InMemoryVectorStore::default();
     info!("Memory index initialized (basic mode)");
     Ok(store)
+}
+
+// ============================================================================
+// Execution Logging System
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExecutionTrace {
+    timestamp: String,
+    rank: Rank,
+    phase: String,
+    status: String,
+    details: String,
+    proposal_title: Option<String>,
+    patch_content: Option<String>,
+    error_details: Option<String>,
+    git_status: Option<String>,
+    audit_score: Option<f32>,
+}
+
+fn execution_log_file() -> &'static str {
+    "./_architect_ai/execution.log"
+}
+
+fn log_execution_trace(trace: &ExecutionTrace) -> Result<()> {
+    fs::create_dir_all(memory_dir()).ok();
+    
+    // Format log entry with timestamp and details
+    let log_entry = format!(
+        "{} [{}] {} - {} - {}\n",
+        trace.timestamp,
+        rank_slug(&trace.rank).to_uppercase(),
+        trace.phase,
+        trace.status,
+        trace.details
+    );
+    
+    // Add proposal details if available
+    let detailed_entry = if let Some(title) = &trace.proposal_title {
+        format!("{}  Proposal: {}\n", log_entry, title)
+    } else {
+        log_entry
+    };
+    
+    // Add patch content if available
+    let full_entry = if let Some(patch) = &trace.patch_content {
+        format!("{}  Patch:\n{}\n", detailed_entry, patch)
+    } else {
+        detailed_entry
+    };
+    
+    // Add error details if available
+    let final_entry = if let Some(error) = &trace.error_details {
+        format!("{}  Error: {}\n", full_entry, error)
+    } else {
+        full_entry
+    };
+    
+    // Add git status if available
+    let complete_entry = if let Some(git_status) = &trace.git_status {
+        format!("{}  Git Status:\n{}\n", final_entry, git_status)
+    } else {
+        final_entry
+    };
+    
+    // Write to file
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(execution_log_file())?;
+    
+    file.write_all(complete_entry.as_bytes())?;
+    file.flush()?;
+    
+    Ok(())
 }
 
 // ============================================================================
@@ -837,8 +913,15 @@ async fn run_architecture_analysis() -> Result<()> {
     let target_file_contents = match fs::read_to_string("src/main.rs") {
         Ok(content) => {
             let first_lines = content.lines().take(50).collect::<Vec<_>>().join("\n");
-            info!("✅ File context loaded: {} total lines, first 50 lines = {} chars", content.lines().count(), first_lines.len());
-            info!("📄 File preview: {}", &first_lines[..std::cmp::min(200, first_lines.len())]);
+            info!(
+                "✅ File context loaded: {} total lines, first 50 lines = {} chars",
+                content.lines().count(),
+                first_lines.len()
+            );
+            info!(
+                "📄 File preview: {}",
+                &first_lines[..std::cmp::min(200, first_lines.len())]
+            );
             Some(first_lines)
         }
         Err(e) => {
@@ -847,8 +930,14 @@ async fn run_architecture_analysis() -> Result<()> {
             match fs::read_to_string("./src/main.rs") {
                 Ok(content) => {
                     let first_lines = content.lines().take(50).collect::<Vec<_>>().join("\n");
-                    info!("✅ File context loaded via relative path: {} lines", content.lines().count());
-                    info!("📄 File preview: {}", &first_lines[..std::cmp::min(200, first_lines.len())]);
+                    info!(
+                        "✅ File context loaded via relative path: {} lines",
+                        content.lines().count()
+                    );
+                    info!(
+                        "📄 File preview: {}",
+                        &first_lines[..std::cmp::min(200, first_lines.len())]
+                    );
                     Some(first_lines)
                 }
                 Err(e2) => {
