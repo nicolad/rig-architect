@@ -1161,27 +1161,37 @@ async fn run_architecture_analysis() -> Result<()> {
     // Check apply
     let target_file = "src/main.rs"; // Primary target file
     
-    // Validate and clean the patch before writing
+    // Validate and clean the patch before writing, with fallback to simple approach
     let patch_content = match validate_and_clean_patch(&proposal.patch, target_file) {
         Ok(cleaned) => cleaned,
         Err(validation_error) => {
             warn!("❌ Patch validation failed: {}", validation_error);
             
-            // Log validation failure
-            log_execution_trace(&ExecutionTrace {
-                timestamp: Utc::now().to_rfc3339(),
-                rank: profile.rank.clone(),
-                phase: "PATCH_CHECK".to_string(),
-                status: "FAILED".to_string(),
-                details: format!("Patch validation failed: {}", validation_error),
-                proposal_title: Some(proposal.title.clone()),
-                patch_content: Some(proposal.patch.clone()),
-                error_details: Some(validation_error.clone()),
-                git_status: None,
-                audit_score: None,
-            }).ok();
-            
-            return Err(anyhow!("Patch validation failed: {}", validation_error));
+            // Try to create a simple unified diff if the patch has basic structure
+            if proposal.patch.contains("--- a/") && proposal.patch.contains("+++ b/") {
+                // The patch has the right structure, just clean it up
+                let mut simple_patch = proposal.patch.clone();
+                if !simple_patch.ends_with('\n') {
+                    simple_patch.push('\n');
+                }
+                simple_patch
+            } else {
+                // Log validation failure and abort
+                log_execution_trace(&ExecutionTrace {
+                    timestamp: Utc::now().to_rfc3339(),
+                    rank: profile.rank.clone(),
+                    phase: "PATCH_CHECK".to_string(),
+                    status: "FAILED".to_string(),
+                    details: format!("Patch validation failed: {}", validation_error),
+                    proposal_title: Some(proposal.title.clone()),
+                    patch_content: Some(proposal.patch.clone()),
+                    error_details: Some(validation_error.clone()),
+                    git_status: None,
+                    audit_score: None,
+                }).ok();
+                
+                return Err(anyhow!("Patch validation failed: {}", validation_error));
+            }
         }
     };
     
@@ -1352,27 +1362,25 @@ async fn run_architecture_analysis() -> Result<()> {
     run(&root, "git", &["config", "user.name", user_name])?;
     run(&root, "git", &["config", "user.email", user_email])?;
 
-    // Determine the current branch; avoid creating a new one.
-    let mut branch = run(&root, "git", &["rev-parse", "--abbrev-ref", "HEAD"])?
+    // Ensure we're on main branch and push directly to main
+    let target_branch = "main";
+    
+    // Get current branch
+    let current_branch = run(&root, "git", &["rev-parse", "--abbrev-ref", "HEAD"])?
         .trim()
         .to_string();
-
-    if branch == "HEAD" {
-        // Detached HEAD → create a branch so we can push somewhere meaningful.
-        let ts = Utc::now()
-            .format("%Y%m%d_%H%M%S")
-            .to_string()
-            .replace(':', "");
-        branch = format!(
-            "{}/{}-{}",
-            config.branch_prefix.trim_end_matches('/'),
-            rank_slug(&profile.rank),
-            ts
-        );
-        info!("🌿 Detached HEAD detected; creating branch: {}", &branch);
-        run(&root, "git", &["checkout", "-b", &branch])?;
+    
+    // Switch to main if not already there
+    if current_branch != target_branch {
+        info!("🌿 Switching to main branch from {}", current_branch);
+        run(&root, "git", &["checkout", target_branch])
+            .or_else(|_| {
+                info!("🌿 Main branch doesn't exist locally, creating from origin");
+                run(&root, "git", &["checkout", "-b", target_branch, "origin/main"])
+            })
+            .context("Failed to switch to main branch")?;
     } else {
-        info!("🌿 Using current branch: {}", &branch);
+        info!("🌿 Already on main branch");
     }
 
     let commit_msg = format!(
@@ -1402,20 +1410,20 @@ async fn run_architecture_analysis() -> Result<()> {
         info!(
             "⬆️ Pushing to {} (branch: {})",
             sanitize_for_log(&push_url),
-            &branch
+            target_branch
         );
-        run(&root, "git", &["push", &push_url, &branch])
+        run(&root, "git", &["push", &push_url, target_branch])
             .context("Failed to push to GitHub - check your GITHUB_TOKEN permissions")?;
     } else {
         info!(
             "⬆️ Pushing (and setting upstream) to {} (branch: {})",
             sanitize_for_log(&push_url),
-            &branch
+            target_branch
         );
         run(
             &root,
             "git",
-            &["push", "--set-upstream", &push_url, &branch],
+            &["push", "--set-upstream", &push_url, target_branch],
         )
         .context("Failed to push to GitHub - check your GITHUB_TOKEN permissions")?;
     }
