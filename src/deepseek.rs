@@ -2,16 +2,22 @@
 //!
 //! This module provides a direct API client for DeepSeek's chat completion API,
 //! bypassing external dependencies for better control and reliability.
+//!
+//! Features:
+//! - Custom HTTP client using reqwest
+//! - Support for DeepSeek's beta endpoint with strict mode
+//! - Function calling with strict JSON schema validation
+//! - Agent-like interface for conversation management
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 /// DeepSeek API client
-pub struct Client {
+pub struct DeepSeekClient {
+    client: reqwest::Client,
     api_key: String,
     base_url: String,
-    client: reqwest::Client,
 }
 
 /// Chat completion request
@@ -23,6 +29,24 @@ struct ChatCompletionRequest {
     temperature: Option<f32>,
     top_p: Option<f32>,
     stream: bool,
+    tools: Option<Vec<Tool>>,
+}
+
+/// Tool definition for function calling
+#[derive(Debug, Serialize)]
+pub struct Tool {
+    #[serde(rename = "type")]
+    tool_type: String,
+    function: Function,
+}
+
+/// Function definition for strict mode
+#[derive(Debug, Serialize)]
+pub struct Function {
+    name: String,
+    description: String,
+    strict: Option<bool>,
+    parameters: serde_json::Value,
 }
 
 /// Chat message
@@ -34,6 +58,7 @@ struct Message {
 
 /// Chat completion response
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ChatCompletionResponse {
     id: String,
     object: String,
@@ -45,6 +70,7 @@ struct ChatCompletionResponse {
 
 /// Response choice
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct Choice {
     index: u32,
     message: Message,
@@ -53,6 +79,7 @@ struct Choice {
 
 /// Token usage information
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct Usage {
     prompt_tokens: u32,
     completion_tokens: u32,
@@ -66,6 +93,7 @@ struct ErrorResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ErrorDetail {
     message: String,
     #[serde(rename = "type")]
@@ -75,11 +103,12 @@ struct ErrorDetail {
 
 /// DeepSeek model constants
 pub mod models {
+    #[allow(dead_code)]
     pub const DEEPSEEK_CHAT: &str = "deepseek-chat";
     pub const DEEPSEEK_REASONER: &str = "deepseek-reasoner";
 }
 
-impl Client {
+impl DeepSeekClient {
     /// Create a new DeepSeek client
     pub fn new(api_key: &str) -> Self {
         let client = reqwest::Client::builder()
@@ -89,7 +118,7 @@ impl Client {
 
         Self {
             api_key: api_key.to_string(),
-            base_url: "https://api.deepseek.com/v1".to_string(),
+            base_url: "https://api.deepseek.com/beta/v1".to_string(), // Use beta endpoint for strict mode
             client,
         }
     }
@@ -101,6 +130,19 @@ impl Client {
         messages: Vec<(String, String)>, // (role, content) pairs
         max_tokens: Option<u32>,
         temperature: Option<f32>,
+    ) -> Result<String> {
+        self.chat_completion_with_tools(model, messages, max_tokens, temperature, None)
+            .await
+    }
+
+    /// Send a chat completion request with tools (strict mode support)
+    pub async fn chat_completion_with_tools(
+        &self,
+        model: &str,
+        messages: Vec<(String, String)>, // (role, content) pairs
+        max_tokens: Option<u32>,
+        temperature: Option<f32>,
+        tools: Option<Vec<Tool>>,
     ) -> Result<String> {
         let messages: Vec<Message> = messages
             .into_iter()
@@ -114,10 +156,11 @@ impl Client {
             temperature,
             top_p: None,
             stream: false,
+            tools, // Use tools parameter
         };
 
         let url = format!("{}/chat/completions", self.base_url);
-        
+
         let response = self
             .client
             .post(&url)
@@ -129,7 +172,10 @@ impl Client {
             .context("Failed to send request to DeepSeek API")?;
 
         let status = response.status();
-        let response_text = response.text().await.context("Failed to read response body")?;
+        let response_text = response
+            .text()
+            .await
+            .context("Failed to read response body")?;
 
         if !status.is_success() {
             // Try to parse error response
@@ -158,14 +204,38 @@ impl Client {
         Ok(completion.choices[0].message.content.clone())
     }
 
-    /// Simple prompt method for single-turn conversations
-    pub async fn prompt(&self, model: &str, system_prompt: &str, user_prompt: &str) -> Result<String> {
+    /// Simple prompt method for quick interactions
+    #[allow(dead_code)]
+    pub async fn prompt(
+        &self,
+        model: &str,
+        system_prompt: &str,
+        user_prompt: &str,
+    ) -> Result<String> {
         let messages = vec![
             ("system".to_string(), system_prompt.to_string()),
             ("user".to_string(), user_prompt.to_string()),
         ];
+        self.chat_completion(model, messages, Some(4000), Some(0.7))
+            .await
+    }
 
-        self.chat_completion(model, messages, Some(4000), Some(0.7)).await
+    /// Create a tool with strict mode enabled
+    #[allow(dead_code)]
+    pub fn create_strict_tool(
+        name: &str,
+        description: &str,
+        parameters: serde_json::Value,
+    ) -> Tool {
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: name.to_string(),
+                description: description.to_string(),
+                strict: Some(true), // Enable strict mode
+                parameters,
+            },
+        }
     }
 
     /// Agent-like interface for maintaining conversation context
@@ -176,14 +246,14 @@ impl Client {
 
 /// Agent wrapper for maintaining conversation state
 pub struct Agent<'a> {
-    client: &'a Client,
+    client: &'a DeepSeekClient,
     model: String,
     system_prompt: Option<String>,
     messages: Vec<Message>,
 }
 
 impl<'a> Agent<'a> {
-    fn new(client: &'a Client, model: &str) -> Self {
+    fn new(client: &'a DeepSeekClient, model: &str) -> Self {
         Self {
             client,
             model: model.to_string(),
@@ -247,14 +317,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_client_creation() {
-        let client = Client::new("test-api-key");
+        let client = DeepSeekClient::new("test-api-key");
         assert_eq!(client.api_key, "test-api-key");
-        assert_eq!(client.base_url, "https://api.deepseek.com/v1");
+        assert_eq!(client.base_url, "https://api.deepseek.com/beta/v1");
     }
 
     #[test]
     fn test_agent_creation() {
-        let client = Client::new("test-key");
+        let client = DeepSeekClient::new("test-key");
         let agent = client.agent(models::DEEPSEEK_CHAT);
         assert_eq!(agent.model, models::DEEPSEEK_CHAT);
     }

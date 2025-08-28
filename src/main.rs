@@ -342,54 +342,60 @@ fn memory_dir() -> &'static str {
 /// Validates and cleans a patch to ensure it can be applied successfully
 fn validate_and_clean_patch(patch: &str, target_file: &str) -> Result<String, String> {
     let lines: Vec<&str> = patch.lines().collect();
-    
+
     // Basic structural validation
     if lines.is_empty() {
         return Err("Patch is empty".to_string());
     }
-    
+
     // Check for required diff headers
     let has_minus_header = lines.iter().any(|line| line.starts_with("--- a/"));
     let has_plus_header = lines.iter().any(|line| line.starts_with("+++ b/"));
-    
+
     if !has_minus_header || !has_plus_header {
         return Err("Patch missing required diff headers (--- a/ and +++ b/)".to_string());
     }
-    
+
     // Check for hunk headers
     let has_hunk = lines.iter().any(|line| line.starts_with("@@"));
     if !has_hunk {
         return Err("Patch missing hunk headers (@@)".to_string());
     }
-    
+
     // Validate file context by checking if target file exists
     if let Ok(file_content) = fs::read_to_string(target_file) {
         let file_lines: Vec<&str> = file_content.lines().collect();
-        
+
         // Extract context lines (lines that start with space) from patch
-        let context_lines: Vec<&str> = lines.iter()
+        let context_lines: Vec<&str> = lines
+            .iter()
             .filter(|line| line.starts_with(' '))
             .map(|line| &line[1..]) // Remove the leading space
             .collect();
-            
+
         // If we have context lines, verify at least some exist in the target file
         if !context_lines.is_empty() {
             let context_found = context_lines.iter().any(|context| {
-                file_lines.iter().any(|file_line| file_line.contains(context))
+                file_lines
+                    .iter()
+                    .any(|file_line| file_line.contains(context))
             });
-            
+
             if !context_found {
-                return Err(format!("Patch context does not match target file: {}", target_file));
+                return Err(format!(
+                    "Patch context does not match target file: {}",
+                    target_file
+                ));
             }
         }
     }
-    
+
     // Clean the patch by ensuring proper line endings
     let mut cleaned_patch = patch.to_string();
     if !cleaned_patch.ends_with('\n') {
         cleaned_patch.push('\n');
     }
-    
+
     Ok(cleaned_patch)
 }
 
@@ -437,10 +443,7 @@ fn append_memory(item: &MemoryItem) -> Result<()> {
     Ok(())
 }
 
-async fn build_memory_index(
-    _ds: &deepseek::Client,
-    _items: &[MemoryItem],
-) -> Result<()> {
+async fn build_memory_index(_ds: &deepseek::DeepSeekClient, _items: &[MemoryItem]) -> Result<()> {
     // For now, just log that memory index is initialized
     // In the future, we could implement a simple in-memory search
     info!("Memory index initialized (basic mode)");
@@ -663,15 +666,15 @@ fn collect_recent_patch_failures() -> Option<String> {
             .into_iter()
             .rev()
             .collect();
-        
+
         let recent_log = recent_lines.join("\n");
-        
+
         // Look for failure patterns
         let has_failures = recent_log.contains("FAILED")
             || recent_log.contains("corrupt patch")
             || recent_log.contains("could not compile")
             || recent_log.contains("error[E0");
-            
+
         if has_failures {
             return Some(recent_log);
         }
@@ -717,7 +720,7 @@ fn improver_preamble(
                 || logs.contains("error[E0")
                 || logs.contains("❌ Code does not compile");
             let has_failures = has_corruption || has_compilation_errors;
-            
+
             if has_failures {
                 if has_compilation_errors {
                     info!("🔧 SELF-IMPROVEMENT TRIGGERED: Detected compilation failures from AI changes");
@@ -1008,7 +1011,7 @@ async fn run_architecture_analysis() -> Result<()> {
     // Provider
     let api_key =
         env::var("DEEPSEEK_API_KEY").context("DEEPSEEK_API_KEY environment variable not set")?;
-    let ds = deepseek::Client::new(&api_key);
+    let ds = deepseek::DeepSeekClient::new(&api_key);
     let chat_model = deepseek::models::DEEPSEEK_REASONER;
 
     // Repo setup
@@ -1107,7 +1110,7 @@ async fn run_architecture_analysis() -> Result<()> {
         .build();
 
     // Ask for proposal.json
-    let resp = improver
+    let resp: String = improver
         .prompt("Propose one tiny improvement now. Follow the protocol strictly.")
         .await?;
     debug!("Improver said: {}", resp);
@@ -1154,13 +1157,13 @@ async fn run_architecture_analysis() -> Result<()> {
 
     // Check apply
     let target_file = "src/main.rs"; // Primary target file
-    
+
     // Validate and clean the patch before writing, with fallback to simple approach
     let patch_content = match validate_and_clean_patch(&proposal.patch, target_file) {
         Ok(cleaned) => cleaned,
         Err(validation_error) => {
             warn!("❌ Patch validation failed: {}", validation_error);
-            
+
             // Try to create a simple unified diff if the patch has basic structure
             if proposal.patch.contains("--- a/") && proposal.patch.contains("+++ b/") {
                 // The patch has the right structure, just clean it up
@@ -1182,13 +1185,14 @@ async fn run_architecture_analysis() -> Result<()> {
                     error_details: Some(validation_error.clone()),
                     git_status: None,
                     audit_score: None,
-                }).ok();
-                
+                })
+                .ok();
+
                 return Err(anyhow!("Patch validation failed: {}", validation_error));
             }
         }
     };
-    
+
     fs::write(patch_path(), &patch_content)?;
 
     // Debug: show the patch content
@@ -1358,19 +1362,23 @@ async fn run_architecture_analysis() -> Result<()> {
 
     // Ensure we're on main branch and push directly to main
     let target_branch = "main";
-    
+
     // Get current branch
     let current_branch = run(&root, "git", &["rev-parse", "--abbrev-ref", "HEAD"])?
         .trim()
         .to_string();
-    
+
     // Switch to main if not already there
     if current_branch != target_branch {
         info!("🌿 Switching to main branch from {}", current_branch);
         run(&root, "git", &["checkout", target_branch])
             .or_else(|_| {
                 info!("🌿 Main branch doesn't exist locally, creating from origin");
-                run(&root, "git", &["checkout", "-b", target_branch, "origin/main"])
+                run(
+                    &root,
+                    "git",
+                    &["checkout", "-b", target_branch, "origin/main"],
+                )
             })
             .context("Failed to switch to main branch")?;
     } else {

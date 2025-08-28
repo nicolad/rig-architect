@@ -4,6 +4,7 @@ use std::env;
 #[derive(Debug, Clone)]
 pub struct Config {
     pub max_changed_lines: usize,
+    #[allow(dead_code)]
     pub branch_prefix: String,
     pub min_audit_avg: f32,
     pub strict_safety: bool,
@@ -51,9 +52,9 @@ impl Config {
 
     /// Validate the cron schedule format
     pub fn validate_cron_schedule(&self) -> Result<(), String> {
-        use std::str::FromStr;
         use apalis_cron::Schedule;
-        
+        use std::str::FromStr;
+
         Schedule::from_str(&self.cron_schedule)
             .map_err(|e| format!("Invalid cron schedule '{}': {}", self.cron_schedule, e))?;
         Ok(())
@@ -82,11 +83,11 @@ mod tests {
     #[test]
     fn test_cron_schedule_validation() {
         let mut config = Config::default();
-        
+
         // Valid schedule
         config.cron_schedule = "0 0 12 * * *".to_string(); // Daily at noon
         assert!(config.validate_cron_schedule().is_ok());
-        
+
         // Invalid schedule
         config.cron_schedule = "invalid cron".to_string();
         assert!(config.validate_cron_schedule().is_err());
