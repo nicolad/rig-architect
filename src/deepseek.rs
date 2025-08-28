@@ -77,13 +77,17 @@ struct Choice {
     finish_reason: Option<String>,
 }
 
-/// Token usage information
+/// Token usage information with context caching support
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct Usage {
     prompt_tokens: u32,
     completion_tokens: u32,
     total_tokens: u32,
+    /// Number of tokens that resulted in a cache hit (0.1 yuan per million tokens)
+    prompt_cache_hit_tokens: Option<u32>,
+    /// Number of tokens that did not result in a cache hit (1 yuan per million tokens)
+    prompt_cache_miss_tokens: Option<u32>,
 }
 
 /// Error response from DeepSeek API
@@ -196,6 +200,23 @@ impl DeepSeekClient {
 
         let completion: ChatCompletionResponse = serde_json::from_str(&response_text)
             .context("Failed to parse chat completion response")?;
+
+        // Log context caching information if available
+        if let (Some(cache_hit), Some(cache_miss)) = (
+            completion.usage.prompt_cache_hit_tokens,
+            completion.usage.prompt_cache_miss_tokens,
+        ) {
+            tracing::info!(
+                "Context cache stats: {} hit tokens, {} miss tokens, cache efficiency: {:.1}%",
+                cache_hit,
+                cache_miss,
+                if cache_hit + cache_miss > 0 {
+                    (cache_hit as f32 / (cache_hit + cache_miss) as f32) * 100.0
+                } else {
+                    0.0
+                }
+            );
+        }
 
         if completion.choices.is_empty() {
             return Err(anyhow!("No choices returned from DeepSeek API"));
