@@ -1035,6 +1035,6 @@ async fn run_architecture_analysis() -> Result<()> {
     }
 
     save_profile(&profile).ok();
-    info!("✅ Success! Branch: {}", branch);
+    info!("✅ Success! Committed to main branch");
     Ok(())
 }
