@@ -348,6 +348,46 @@ fn validate_and_clean_patch(patch: &str, target_file: &str) -> Result<String, St
         return Err("Patch is empty".to_string());
     }
 
+    // Check for duplicate diff headers (common AI generation error)
+    let minus_headers: Vec<_> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.starts_with("--- a/"))
+        .collect();
+    let plus_headers: Vec<_> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.starts_with("+++ b/"))
+        .collect();
+
+    if minus_headers.len() > 1 || plus_headers.len() > 1 {
+        // Remove duplicate headers - keep only the first occurrence
+        let mut cleaned_lines = Vec::new();
+        let mut seen_minus = false;
+        let mut seen_plus = false;
+
+        for line in lines {
+            if line.starts_with("--- a/") {
+                if !seen_minus {
+                    cleaned_lines.push(line);
+                    seen_minus = true;
+                }
+                // Skip duplicate minus headers
+            } else if line.starts_with("+++ b/") {
+                if !seen_plus {
+                    cleaned_lines.push(line);
+                    seen_plus = true;
+                }
+                // Skip duplicate plus headers
+            } else {
+                cleaned_lines.push(line);
+            }
+        }
+
+        let cleaned_patch = cleaned_lines.join("\n");
+        return validate_and_clean_patch(&cleaned_patch, target_file); // Recursive call with cleaned patch
+    }
+
     // Check for required diff headers
     let has_minus_header = lines.iter().any(|line| line.starts_with("--- a/"));
     let has_plus_header = lines.iter().any(|line| line.starts_with("+++ b/"));
@@ -738,10 +778,18 @@ fn improver_preamble(
          \n\
          🚨 IMMEDIATE FIXES NEEDED:\n\
          - Fix patch format corruption (corrupt patch at line X errors)\n\
+         - NEVER duplicate diff headers (--- a/ and +++ b/ should appear only once each)\n\
          - Stop using placeholder text like 'XXX,XX' or 'someindex' in patches\n\
          - Ensure exact line number matching with current file content\n\
          - Validate import statements before changing them\n\
          - Add proper context lines (3-5 before/after changes)\n\
+         \n\
+         🎯 PATCH FORMAT REQUIREMENTS:\n\
+         - Start with exactly one '--- a/filename' line\n\
+         - Follow with exactly one '+++ b/filename' line\n\
+         - Use accurate @@ line numbers from current file content\n\
+         - Include sufficient unchanged context lines around changes\n\
+         - Ensure clean line endings (no trailing spaces or tabs)\n\
          \n\
          🎯 DEEPSEEK ANALYSIS INTEGRATION:\n\
          - Use the provided file context to generate accurate patches\n\
@@ -751,7 +799,8 @@ fn improver_preamble(
          \n\
          CRITICAL: Generate patches that apply cleanly on first try!\n\
          CRITICAL: Use real line numbers, not placeholders!\n\
-         CRITICAL: Include sufficient context for git apply to work!\n"
+         CRITICAL: Include sufficient context for git apply to work!\n\
+         CRITICAL: NO DUPLICATE HEADERS in patch format!"
     } else {
         ""
     };
