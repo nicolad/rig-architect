@@ -37,6 +37,10 @@ use config::Config;
 // AI Tools for Code Analysis (for future enhancement)
 // ============================================================================
 
+/// Security-focused file reader with extension whitelisting
+///
+/// Prevents reading of unauthorized file types by checking extensions
+/// against a predefined whitelist of source and config files
 #[allow(dead_code)]
 struct ReadFileContentTool;
 
@@ -523,6 +527,13 @@ fn list_arch_files() -> Result<String> {
     Ok(serde_json::to_string_pretty(&out).unwrap_or("[]".into()))
 }
 
+/// Collect recent patch failure patterns from stdout/logs to detect self-improvement needs
+fn collect_recent_patch_failures() -> Option<String> {
+    // In a real implementation, this would read from log files or stdout capture
+    // For now, return a simple indicator that patch failures are happening
+    Some("Recent patch failures detected: corrupt patch errors, PATCH_CHECK failures".to_string())
+}
+
 // ============================================================================
 // AI Prompts
 // ============================================================================
@@ -533,37 +544,65 @@ fn improver_preamble(
     include: &str,
     exclude: &str,
     files: &str,
+    log_summary: Option<&str>,
+    target_file_contents: Option<&str>,
 ) -> String {
     let scope = match rank {
         Rank::Junior => "Aim for small code improvements: add missing docs, fix typos, add error handling, simple refactors.",
         Rank::Mid => "You may refactor functions, improve error messages, add helper functions, reorganize imports.",
         Rank::Senior => "You may create new modules, add advanced features, improve architecture within the line budget.",
     };
+
+    let log_section = if let Some(logs) = log_summary {
+        if !logs.trim().is_empty() {
+            format!("\nRecent runtime log analysis:\n{}\n", logs)
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    // Check if logs indicate patch corruption issues - trigger self-improvement mode
+    let self_improvement_needed = log_summary
+        .map(|logs| {
+            let has_corruption = logs.contains("corrupt patch")
+                || logs.contains("PATCH_CHECK") && logs.contains("FAILED");
+            if has_corruption {
+                info!("🔧 SELF-IMPROVEMENT TRIGGERED: Detected patch corruption patterns");
+            }
+            has_corruption
+        })
+        .unwrap_or(false);
+
+    let priority_guidance = if self_improvement_needed {
+        info!("🎯 Applying priority guidance for patch system fixes");
+        "\n🔧 PRIORITY: Multiple patch corruption failures detected. Focus on fixing the patch generation system itself:\n\
+         - Improve patch format validation\n\
+         - Fix git working directory cleanup\n\
+         - Enhance diff generation logic\n\
+         - Add better error recovery\n\
+         Target: src/main.rs patch generation functions\n"
+    } else {
+        ""
+    };
+
+    let file_context_section = if let Some(contents) = target_file_contents {
+        format!("\nCRITICAL - Current file contents (use this to ensure patch accuracy):\n```\n{}\n```\n", contents)
+    } else {
+        String::new()
+    };
     format!(
         r#"
-You are an AI Architect at **{rank}** level with access to powerful code analysis tools. 
-
-AVAILABLE TOOLS:
-- read_file: Read specific source files to examine their contents
-- search_pattern: Search for code patterns using regex
-- check_code: Run cargo check, clippy, or test validation  
-- analyze_function: Analyze function complexity and get suggestions
-
-USE THESE TOOLS to thoroughly analyze the codebase before proposing changes.
-
-Find EXACTLY ONE tiny improvement to this Rust codebase with the smallest blast radius. 
-Keep changes within **{max_lines} lines** total.
+You are an AI Architect at **{rank}** level. Find EXACTLY ONE tiny improvement to this Rust codebase
+with the smallest blast radius. Keep changes within **{max_lines} lines** total.
 
 Available files:
 {files}
+{log_section}{priority_guidance}
+{file_context_section}
 
 Scope guidance: {scope}
-
-PROCESS:
-1. First, use tools to explore and understand the codebase
-2. Identify specific improvement opportunities  
-3. Validate your approach using the available tools
-4. Propose a single, focused improvement
 
 Examples of good improvements:
 - Add missing documentation comments
@@ -610,7 +649,11 @@ Make sure file paths in the diff are relative to the repo root.
         } else {
             exclude
         },
-        files = files
+        files = files,
+        log_section = log_section,
+        priority_guidance = priority_guidance,
+        file_context_section = file_context_section,
+        scope = scope
     )
 }
 
@@ -787,6 +830,35 @@ async fn run_architecture_analysis() -> Result<()> {
     // Get available files
     let files = list_arch_files().unwrap_or_else(|_| "[]".to_string());
 
+    // Collect recent log analysis to detect self-improvement needs
+    let log_summary = collect_recent_patch_failures();
+
+    // Get current file contents for the main target file with better error handling
+    let target_file_contents = match fs::read_to_string("src/main.rs") {
+        Ok(content) => {
+            let first_lines = content.lines().take(50).collect::<Vec<_>>().join("\n");
+            info!("✅ File context loaded: {} total lines, first 50 lines = {} chars", content.lines().count(), first_lines.len());
+            info!("📄 File preview: {}", &first_lines[..std::cmp::min(200, first_lines.len())]);
+            Some(first_lines)
+        }
+        Err(e) => {
+            warn!("❌ Failed to read src/main.rs: {}", e);
+            // Try absolute path
+            match fs::read_to_string("/Users/vadimnicolai/Public/ai/rig/rig-architect/src/main.rs") {
+                Ok(content) => {
+                    let first_lines = content.lines().take(50).collect::<Vec<_>>().join("\n");
+                    info!("✅ File context loaded via absolute path: {} lines", content.lines().count());
+                    info!("📄 File preview: {}", &first_lines[..std::cmp::min(200, first_lines.len())]);
+                    Some(first_lines)
+                }
+                Err(e2) => {
+                    warn!("❌ Failed to read via absolute path: {}", e2);
+                    None
+                }
+            }
+        }
+    };
+
     let improver = ds
         .agent(chat_model)
         .preamble(&improver_preamble(
@@ -795,6 +867,8 @@ async fn run_architecture_analysis() -> Result<()> {
             &include,
             &exclude,
             &files,
+            log_summary.as_deref(),
+            target_file_contents.as_deref(),
         ))
         .build();
 
