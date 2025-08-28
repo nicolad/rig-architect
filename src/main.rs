@@ -345,6 +345,60 @@ struct MemoryItem {
 fn memory_dir() -> &'static str {
     "./_architect_ai"
 }
+/// Validates and cleans a patch to ensure it can be applied successfully
+fn validate_and_clean_patch(patch: &str, target_file: &str) -> Result<String, String> {
+    let lines: Vec<&str> = patch.lines().collect();
+    
+    // Basic structural validation
+    if lines.is_empty() {
+        return Err("Patch is empty".to_string());
+    }
+    
+    // Check for required diff headers
+    let has_minus_header = lines.iter().any(|line| line.starts_with("--- a/"));
+    let has_plus_header = lines.iter().any(|line| line.starts_with("+++ b/"));
+    
+    if !has_minus_header || !has_plus_header {
+        return Err("Patch missing required diff headers (--- a/ and +++ b/)".to_string());
+    }
+    
+    // Check for hunk headers
+    let has_hunk = lines.iter().any(|line| line.starts_with("@@"));
+    if !has_hunk {
+        return Err("Patch missing hunk headers (@@)".to_string());
+    }
+    
+    // Validate file context by checking if target file exists
+    if let Ok(file_content) = fs::read_to_string(target_file) {
+        let file_lines: Vec<&str> = file_content.lines().collect();
+        
+        // Extract context lines (lines that start with space) from patch
+        let context_lines: Vec<&str> = lines.iter()
+            .filter(|line| line.starts_with(' '))
+            .map(|line| &line[1..]) // Remove the leading space
+            .collect();
+            
+        // If we have context lines, verify at least some exist in the target file
+        if !context_lines.is_empty() {
+            let context_found = context_lines.iter().any(|context| {
+                file_lines.iter().any(|file_line| file_line.contains(context))
+            });
+            
+            if !context_found {
+                return Err(format!("Patch context does not match target file: {}", target_file));
+            }
+        }
+    }
+    
+    // Clean the patch by ensuring proper line endings
+    let mut cleaned_patch = patch.to_string();
+    if !cleaned_patch.ends_with('\n') {
+        cleaned_patch.push('\n');
+    }
+    
+    Ok(cleaned_patch)
+}
+
 fn patch_path() -> &'static str {
     "./_architect_ai/patch.diff"
 }
@@ -683,17 +737,24 @@ fn improver_preamble(
 
     let priority_guidance = if self_improvement_needed {
         info!("🎯 Applying priority guidance for system fixes");
-        "\n🔧 PRIORITY: System failures detected. Focus on fixing core issues:\n\
-         - Fix compilation errors from incorrect imports/syntax\n\
-         - Improve patch format validation and generation\n\
-         - Fix git working directory cleanup\n\
-         - Enhance diff generation logic with proper context\n\
-         - Add better error recovery and rollback\n\
-         - Validate changes before committing\n\
-         Target: src/main.rs core functions\n\
+        "\n🔧 PRIORITY: System failures detected in logs. Focus on fixing core patch generation issues:\n\
          \n\
-         CRITICAL: Always verify imports exist before changing them!\n\
-         CRITICAL: Test compilation before generating patches!\n"
+         🚨 IMMEDIATE FIXES NEEDED:\n\
+         - Fix patch format corruption (corrupt patch at line X errors)\n\
+         - Stop using placeholder text like 'XXX,XX' or 'someindex' in patches\n\
+         - Ensure exact line number matching with current file content\n\
+         - Validate import statements before changing them\n\
+         - Add proper context lines (3-5 before/after changes)\n\
+         \n\
+         🎯 DEEPSEEK ANALYSIS INTEGRATION:\n\
+         - Use the provided file context to generate accurate patches\n\
+         - Match exact line numbers and content from the current file state\n\
+         - Verify all imports and dependencies exist before modifying them\n\
+         - Test logical changes against current codebase structure\n\
+         \n\
+         CRITICAL: Generate patches that apply cleanly on first try!\n\
+         CRITICAL: Use real line numbers, not placeholders!\n\
+         CRITICAL: Include sufficient context for git apply to work!\n"
     } else {
         ""
     };
@@ -744,8 +805,27 @@ Output JSON format (respond with just the JSON, no fences):
   "estimated_changed_lines": <int|null>
 }}
 
-The unified diff MUST apply cleanly with 'git apply --check'.
-Make sure file paths in the diff are relative to the repo root.
+CRITICAL PATCH FORMAT REQUIREMENTS:
+1. The unified diff MUST apply cleanly with 'git apply --check'
+2. Use EXACT file paths relative to repo root: "--- a/src/main.rs" and "+++ b/src/main.rs"
+3. Include sufficient context lines (3-5 lines before and after changes)
+4. Use proper hunk headers: @@ -67,7 +67,6 @@ struct ReadFileContentTool;
+5. Context lines start with space, deletions with -, additions with +
+6. Line numbers in hunk headers must match the actual file content
+7. NEVER use placeholder text like "XXX,XX" or "someindex" - use real line numbers
+8. Verify the context matches the current file state exactly
+
+EXAMPLE CORRECT PATCH FORMAT:
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -45,7 +45,7 @@ impl ReadFileContentTool {{
+ 
+     async fn read_file(&self, file_path: String) -> Result<String, String> {{
+         // Security check - only allow reading source files
+-        if !file_path.ends_with(".rs") {{
++        if !file_path.ends_with(".rs") && !file_path.ends_with(".toml") {{
+             return Err("Only .rs files are allowed".to_string());
+         }}
 "#,
         rank = match rank {
             Rank::Junior => "junior",
@@ -1079,11 +1159,32 @@ async fn run_architecture_analysis() -> Result<()> {
     }
 
     // Check apply
-    let mut patch_content = proposal.patch.clone();
-    // Ensure the patch ends with a newline to avoid corruption
-    if !patch_content.ends_with('\n') {
-        patch_content.push('\n');
-    }
+    let target_file = "src/main.rs"; // Primary target file
+    
+    // Validate and clean the patch before writing
+    let patch_content = match validate_and_clean_patch(&proposal.patch, target_file) {
+        Ok(cleaned) => cleaned,
+        Err(validation_error) => {
+            warn!("❌ Patch validation failed: {}", validation_error);
+            
+            // Log validation failure
+            log_execution_trace(&ExecutionTrace {
+                timestamp: Utc::now().to_rfc3339(),
+                rank: profile.rank.clone(),
+                phase: "PATCH_CHECK".to_string(),
+                status: "FAILED".to_string(),
+                details: format!("Patch validation failed: {}", validation_error),
+                proposal_title: Some(proposal.title.clone()),
+                patch_content: Some(proposal.patch.clone()),
+                error_details: Some(validation_error.clone()),
+                git_status: None,
+                audit_score: None,
+            }).ok();
+            
+            return Err(anyhow!("Patch validation failed: {}", validation_error));
+        }
+    };
+    
     fs::write(patch_path(), &patch_content)?;
 
     // Debug: show the patch content
