@@ -7,10 +7,10 @@ mod config;
 
 use std::{
     env, fs,
+    io::Write,
     path::{Path, PathBuf},
     process::Command,
     str::FromStr,
-    io::Write,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -423,7 +423,7 @@ fn execution_log_file() -> &'static str {
 
 fn log_execution_trace(trace: &ExecutionTrace) -> Result<()> {
     fs::create_dir_all(memory_dir()).ok();
-    
+
     // Format log entry with timestamp and details
     let log_entry = format!(
         "{} [{}] {} - {} - {}\n",
@@ -433,44 +433,44 @@ fn log_execution_trace(trace: &ExecutionTrace) -> Result<()> {
         trace.status,
         trace.details
     );
-    
+
     // Add proposal details if available
     let detailed_entry = if let Some(title) = &trace.proposal_title {
         format!("{}  Proposal: {}\n", log_entry, title)
     } else {
         log_entry
     };
-    
+
     // Add patch content if available
     let full_entry = if let Some(patch) = &trace.patch_content {
         format!("{}  Patch:\n{}\n", detailed_entry, patch)
     } else {
         detailed_entry
     };
-    
+
     // Add error details if available
     let final_entry = if let Some(error) = &trace.error_details {
         format!("{}  Error: {}\n", full_entry, error)
     } else {
         full_entry
     };
-    
+
     // Add git status if available
     let complete_entry = if let Some(git_status) = &trace.git_status {
         format!("{}  Git Status:\n{}\n", final_entry, git_status)
     } else {
         final_entry
     };
-    
+
     // Write to file
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(execution_log_file())?;
-    
+
     file.write_all(complete_entry.as_bytes())?;
     file.flush()?;
-    
+
     Ok(())
 }
 
@@ -801,7 +801,22 @@ fn rank_slug(r: &Rank) -> &'static str {
 async fn architect_cron_job(job: ArchitectReminder, svc: Data<ArchitectService>) {
     info!("🕒 Cron job triggered at {:?}", job.0);
     if let Err(e) = svc.execute(job).await {
-        warn!("❌ Architecture analysis failed: {}", e);
+        warn!("❌ Architecture analysis failed in cron job: {}", e);
+
+        // Log cron failure
+        log_execution_trace(&ExecutionTrace {
+            timestamp: Utc::now().to_rfc3339(),
+            rank: Rank::Junior, // Default rank for cron failures
+            phase: "CRON_FAILURE".to_string(),
+            status: "FAILED".to_string(),
+            details: format!("Architecture analysis failed in cron job: {}", e),
+            proposal_title: None,
+            patch_content: None,
+            error_details: Some(format!("Error: {}", e)),
+            git_status: None,
+            audit_score: None,
+        })
+        .ok();
     }
 }
 
@@ -894,6 +909,24 @@ async fn run_architecture_analysis() -> Result<()> {
     let memory = load_memory();
     let _store = build_memory_index(&ds, &memory).await?;
 
+    // Log analysis start
+    log_execution_trace(&ExecutionTrace {
+        timestamp: Utc::now().to_rfc3339(),
+        rank: profile.rank.clone(),
+        phase: "START".to_string(),
+        status: "INFO".to_string(),
+        details: format!(
+            "Starting analysis - rank={:?}, streak={}, avg={:.2}",
+            profile.rank, profile.success_streak, profile.rolling_avg
+        ),
+        proposal_title: None,
+        patch_content: None,
+        error_details: None,
+        git_status: None,
+        audit_score: None,
+    })
+    .ok();
+
     info!(
         "👤 Current profile: rank={:?}, streak={}, avg={:.2}",
         profile.rank, profile.success_streak, profile.rolling_avg
@@ -973,6 +1006,24 @@ async fn run_architecture_analysis() -> Result<()> {
 
     info!("📝 Proposal: {}", proposal.title);
 
+    // Log proposal generation
+    log_execution_trace(&ExecutionTrace {
+        timestamp: Utc::now().to_rfc3339(),
+        rank: profile.rank.clone(),
+        phase: "PROPOSAL".to_string(),
+        status: "SUCCESS".to_string(),
+        details: "AI generated proposal successfully".to_string(),
+        proposal_title: Some(proposal.title.clone()),
+        patch_content: Some(format!(
+            "--- a/{}\n+++ b/{}\n{}",
+            "src/main.rs", "src/main.rs", proposal.patch
+        )),
+        error_details: None,
+        git_status: None,
+        audit_score: None,
+    })
+    .ok();
+
     // Safety rails pre-audit
     let mut changed = proposal
         .estimated_changed_lines
@@ -1002,15 +1053,52 @@ async fn run_architecture_analysis() -> Result<()> {
 
     // Try to apply the patch and provide better error info
     match run(&root, "git", &["apply", "--check", patch_path()]) {
-        Ok(_) => info!("✅ Patch applies cleanly"),
+        Ok(_) => {
+            info!("✅ Patch applies cleanly");
+            log_execution_trace(&ExecutionTrace {
+                timestamp: Utc::now().to_rfc3339(),
+                rank: profile.rank.clone(),
+                phase: "PATCH_CHECK".to_string(),
+                status: "SUCCESS".to_string(),
+                details: "Patch validation successful".to_string(),
+                proposal_title: Some(proposal.title.clone()),
+                patch_content: Some(proposal.patch.clone()),
+                error_details: None,
+                git_status: None,
+                audit_score: None,
+            })
+            .ok();
+        }
         Err(e) => {
             warn!("❌ Patch failed to apply: {}", e);
             // Show patch content for debugging
             debug!("Patch content length: {} bytes", patch_content.len());
             debug!("Patch content:\n{}", patch_content);
+
+            // Get git status for logging
+            let git_status = run(&root, "git", &["status", "--porcelain"]).unwrap_or_default();
+
+            // Log patch failure
+            log_execution_trace(&ExecutionTrace {
+                timestamp: Utc::now().to_rfc3339(),
+                rank: profile.rank.clone(),
+                phase: "PATCH_CHECK".to_string(),
+                status: "FAILED".to_string(),
+                details: format!("Patch failed to apply: {}", e),
+                proposal_title: Some(proposal.title.clone()),
+                patch_content: Some(proposal.patch.clone()),
+                error_details: Some(format!(
+                    "git [\"apply\", \"--check\", \"./_architect_ai/patch.diff\"] failed: {}",
+                    e
+                )),
+                git_status: Some(git_status.clone()),
+                audit_score: None,
+            })
+            .ok();
+
             // Show git status for debugging
-            if let Ok(status) = run(&root, "git", &["status", "--porcelain"]) {
-                debug!("Git status:\n{}", status);
+            if !git_status.is_empty() {
+                debug!("Git status:\n{}", git_status);
             }
             // Show current working directory files
             if let Ok(files) = list_arch_files() {
@@ -1070,6 +1158,36 @@ async fn run_architecture_analysis() -> Result<()> {
         verdict.ok, avg_score, safety_ok
     );
     debug!("Audit comments: {:?}", verdict.comments);
+
+    // Log audit results
+    log_execution_trace(&ExecutionTrace {
+        timestamp: Utc::now().to_rfc3339(),
+        rank: profile.rank.clone(),
+        phase: "AUDIT".to_string(),
+        status: if safety_ok && avg_score >= config.min_audit_avg {
+            "SUCCESS"
+        } else {
+            "FAILED"
+        }
+        .to_string(),
+        details: format!(
+            "Audit completed - ok:{} score:{:.2} safety:{}",
+            verdict.ok, avg_score, safety_ok
+        ),
+        proposal_title: Some(proposal.title.clone()),
+        patch_content: None,
+        error_details: if !safety_ok || avg_score < config.min_audit_avg {
+            Some(format!(
+                "Audit gate failed - avg={:.2}, safety_ok={}",
+                avg_score, safety_ok
+            ))
+        } else {
+            None
+        },
+        git_status: None,
+        audit_score: Some(avg_score),
+    })
+    .ok();
 
     if avg_score < config.min_audit_avg || (config.strict_safety && !safety_ok) {
         warn!(
@@ -1197,6 +1315,25 @@ async fn run_architecture_analysis() -> Result<()> {
     }
 
     save_profile(&profile).ok();
+
+    // Log final success
+    log_execution_trace(&ExecutionTrace {
+        timestamp: Utc::now().to_rfc3339(),
+        rank: profile.rank.clone(),
+        phase: "COMPLETE".to_string(),
+        status: "SUCCESS".to_string(),
+        details: format!(
+            "Architecture improvement completed successfully - committed to main, promoted: {}",
+            promoted
+        ),
+        proposal_title: Some(proposal.title.clone()),
+        patch_content: None,
+        error_details: None,
+        git_status: None,
+        audit_score: Some(avg_score),
+    })
+    .ok();
+
     info!("✅ Success! Committed to main branch");
     Ok(())
 }

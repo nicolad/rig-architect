@@ -1,11 +1,40 @@
 --- a/src/main.rs
 +++ b/src/main.rs
-@@ -25,8 +25,7 @@ use anyhow::{anyhow, Context, Result};
- use apalis::layers::retry::RetryPolicy;
- use apalis::prelude::*;
- use apalis_cron::CronStream;
--use apalis_cron::Schedule;
-+use apalis_cron::{CronStream, Schedule};
- use chrono::{DateTime, Utc};
- use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
- use regex::Regex;
+@@ -38,6 +38,15 @@ use config::Config;
+ // ============================================================================
+ 
+ /// Security-focused file reader with extension whitelisting
++///
++/// This tool prevents reading of unauthorized file types by checking extensions
++/// against a predefined whitelist of source and config files. It provides
++/// an additional layer of security when reading files during code analysis.
++///
++/// # Examples
++/// ```
++/// # use anyhow::Result;
++/// # async fn example() -> Result<()> {
++/// #    let tool = ReadFileContentTool;
++/// #    let content = tool.read_file("src/main.rs".to_string()).await?;
++/// #    Ok(())
++/// # }
++/// ```
+ #[allow(dead_code)]
+ struct ReadFileContentTool;
+ 
+@@ -45,6 +54,16 @@ struct ReadFileContentTool;
+ impl ReadFileContentTool {
+     /// Reads the content of a file if its extension is whitelisted
+     ///
++    /// This method performs security checks before reading any file content
++    /// to ensure only authorized file types are accessed during analysis.
++    ///
++    /// # Arguments
++    /// * `file_path` - Path to the file to be read
++    ///
++    /// # Returns
++    /// Returns the file content as a String if successful, or an error message
++    /// if the file type is not whitelisted or cannot be read.
++    ///
+     /// Prevents reading of unauthorized file types by checking extensions
+     /// against a predefined whitelist of source and config files
+     async fn read_file(&self, file_path: String) -> Result<String, String> {
